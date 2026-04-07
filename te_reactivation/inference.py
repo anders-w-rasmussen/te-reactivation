@@ -1,8 +1,8 @@
 """
-SVI inference for the hierarchical TE reactivation model.
+SVI inference for the TE reactivation model.
 
-Post-hoc discrete posteriors marginalize over locus-level scaling w_fi
-by fixing them at their variational means during the LL ratio computation.
+No per-locus latent variables — locus heterogeneity handled by NegBin
+dispersion. Scales to 100k+ loci without ELBO divergence.
 """
 
 import torch
@@ -51,7 +51,6 @@ def run_svi(
         if print_every and (step + 1) % print_every == 0:
             print(f"Step {step+1:>5d} | ELBO loss: {loss:>10.1f}")
 
-    # Compute discrete posteriors
     z_posterior = _compute_z_posteriors(sense, antisense, lengths, data.n_families,
                                         flank_s, flank_a)
 
@@ -72,9 +71,6 @@ def _compute_z_posteriors(sense, antisense, lengths, n_families,
                            flank_s, flank_a, n_mc=200):
     """
     Compute P(z_f=1 | data) via log-likelihood ratio.
-
-    Uses learned locus-level w_fi (at variational mean) so that
-    the LL ratio reflects the family-level effect, not individual hot loci.
     """
     log_odds_samples = np.zeros((n_mc, n_families))
 
@@ -84,21 +80,18 @@ def _compute_z_posteriors(sense, antisense, lengths, n_families,
         )
 
         pi = guide_trace.nodes["pi"]["value"]
-        inv_disp = guide_trace.nodes["inv_disp"]["value"]
+        inv_disp_bg = guide_trace.nodes["inv_disp_bg"]["value"]
+        inv_disp_fg = guide_trace.nodes["inv_disp_fg"]["value"]
         bg_scale = guide_trace.nodes["bg_scale"]["value"]
         log_fg = guide_trace.nodes["log_fg"]["value"]
         ar = guide_trace.nodes["antisense_ratio"]["value"]
 
         log_prior_odds = torch.log(pi + 1e-8) - torch.log(1 - pi + 1e-8)
+        disp_active = torch.minimum(inv_disp_bg, inv_disp_fg)
 
         for f in range(n_families):
             lengths_kb = lengths[f] / 1000.0
 
-            # Locus-level scale from guide
-            log_w = guide_trace.nodes[f"log_w_{f}"]["value"]
-            w = torch.exp(log_w)
-
-            # Background
             if flank_s is not None:
                 bg_s = bg_scale * flank_s[f] * lengths_kb + 1e-6
                 bg_a = bg_scale * flank_a[f] * lengths_kb + 1e-6
@@ -106,22 +99,23 @@ def _compute_z_posteriors(sense, antisense, lengths, n_families,
                 bg_s = bg_scale * lengths_kb + 1e-6
                 bg_a = bg_scale * lengths_kb + 1e-6
 
-            # Foreground with locus scaling
-            fg_s = torch.exp(log_fg[f]) * w * lengths_kb
-            fg_a = torch.exp(log_fg[f]) * ar[f] * w * lengths_kb
+            fg_s = torch.exp(log_fg[f]) * lengths_kb
+            fg_a = torch.exp(log_fg[f]) * ar[f] * lengths_kb
 
             mu_s_0 = bg_s
             mu_a_0 = bg_a
             mu_s_1 = bg_s + fg_s
             mu_a_1 = bg_a + fg_a
 
+            # z=0: background dispersion only
             ll_0 = (
-                dist.GammaPoisson(inv_disp, inv_disp / mu_s_0).log_prob(sense[f]).sum()
-                + dist.GammaPoisson(inv_disp, inv_disp / mu_a_0).log_prob(antisense[f]).sum()
+                dist.GammaPoisson(inv_disp_bg, inv_disp_bg / mu_s_0).log_prob(sense[f]).sum()
+                + dist.GammaPoisson(inv_disp_bg, inv_disp_bg / mu_a_0).log_prob(antisense[f]).sum()
             )
+            # z=1: potentially more overdispersed (active dispersion)
             ll_1 = (
-                dist.GammaPoisson(inv_disp, inv_disp / mu_s_1).log_prob(sense[f]).sum()
-                + dist.GammaPoisson(inv_disp, inv_disp / mu_a_1).log_prob(antisense[f]).sum()
+                dist.GammaPoisson(disp_active, disp_active / mu_s_1).log_prob(sense[f]).sum()
+                + dist.GammaPoisson(disp_active, disp_active / mu_a_1).log_prob(antisense[f]).sum()
             )
 
             log_odds_samples[s, f] = (ll_1 - ll_0 + log_prior_odds).item()
@@ -132,45 +126,32 @@ def _compute_z_posteriors(sense, antisense, lengths, n_families,
 
 
 def summarize_results(results: dict, threshold: float = 0.5) -> None:
-    """Print a summary of reactivation calls."""
     print("\n" + "=" * 60)
     print("TE Family Reactivation Results")
     print("=" * 60)
-    print(f"{'Family':<25s} {'P(reactivated)':>15s} {'sigma_w':>10s} {'Call':>8s}")
+    print(f"{'Family':<25s} {'P(reactivated)':>15s} {'Call':>8s}")
     print("-" * 60)
 
     z = results["z_posterior"]
     names = results["family_names"]
-    params = results["params"]
-
-    # sigma_w tells us about locus heterogeneity
-    sigma_w_loc = params.get("sigma_w_loc", np.zeros(len(z)))
 
     order = np.argsort(-z)
     for idx in order:
         call = "ACTIVE" if z[idx] >= threshold else "silent"
-        print(f"{names[idx]:<25s} {z[idx]:>15.3f} {sigma_w_loc[idx]:>10.3f} {call:>8s}")
+        print(f"{names[idx]:<25s} {z[idx]:>15.3f} {call:>8s}")
 
     n_active = (z >= threshold).sum()
     print("-" * 60)
     print(f"Total reactivated: {int(n_active)} / {len(z)} families (threshold={threshold})")
 
-    # Report antisense ratios and sigma_w for active families
+    params = results["params"]
     ar_alpha = params.get("ar_alpha")
     ar_beta = params.get("ar_beta")
     if ar_alpha is not None:
         ar_mean = ar_alpha / (ar_alpha + ar_beta)
-        print(f"\n{'Family':<25s} {'P(react)':>10s} {'AS/S':>8s} {'sigma_w':>10s} {'Pattern':>12s}")
-        print("-" * 70)
+        print(f"\n{'Family':<25s} {'P(react)':>10s} {'AS/S':>8s} {'dsRNA?':>8s}")
+        print("-" * 60)
         for idx in order:
             if z[idx] >= threshold:
-                dsrna = "dsRNA" if ar_mean[idx] > 0.3 else "sense-only"
-                # sigma_w interpretation
-                if sigma_w_loc[idx] < 0.3:
-                    pattern = "uniform"
-                elif sigma_w_loc[idx] < 0.8:
-                    pattern = "moderate"
-                else:
-                    pattern = "focal"
-                print(f"{names[idx]:<25s} {z[idx]:>10.3f} {ar_mean[idx]:>8.3f} "
-                      f"{sigma_w_loc[idx]:>10.3f} {pattern:>12s}")
+                dsrna = "yes" if ar_mean[idx] > 0.3 else "low"
+                print(f"{names[idx]:<25s} {z[idx]:>10.3f} {ar_mean[idx]:>8.3f} {dsrna:>8s}")
