@@ -155,24 +155,36 @@ def extract_positional_profiles(
     bam_path: str,
     bed_df: pd.DataFrame,
     n_bins: int = 50,
+    flank_frac: float = 0.5,
 ) -> dict[str, dict]:
     """
-    Extract positional read profiles across the TE body for each family.
+    Extract positional read profiles across the TE body AND flanking regions.
 
-    For each read, maps its start position to a relative coordinate [0, 1]
-    within the TE locus (0 = 5' end, 1 = 3' end, respecting TE strand).
-    Aggregates across all loci per family.
+    Coordinates: [-flank_frac, 0] = 5' flank, [0, 1] = TE body, [1, 1+flank_frac] = 3' flank.
+    Flank size is flank_frac * TE_length per locus (so flanks scale with element size).
 
-    Returns dict: family_name -> {"sense": array[n_bins], "antisense": array[n_bins], "n_loci": int}
+    Returns dict: family_name -> {
+        "sense": array, "antisense": array, "n_loci": int,
+        "bin_centers": array (the x-axis coordinates)
+    }
     """
     import pysam
 
     bam = pysam.AlignmentFile(bam_path, "rb")
-    bins = np.linspace(0, 1, n_bins + 1)
 
-    # Accumulate per-family
+    # Total range: [-flank_frac, 1+flank_frac], with n_bins for the TE body
+    # and proportional bins for flanks
+    flank_bins = int(n_bins * flank_frac)
+    total_bins = flank_bins + n_bins + flank_bins
+    range_start = -flank_frac
+    range_end = 1.0 + flank_frac
+
+    bin_edges = np.linspace(range_start, range_end, total_bins + 1)
+    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+
     families = bed_df["te_family"].unique()
-    profiles = {fam: {"sense": np.zeros(n_bins), "antisense": np.zeros(n_bins), "n_loci": 0}
+    profiles = {fam: {"sense": np.zeros(total_bins), "antisense": np.zeros(total_bins),
+                       "n_loci": 0, "bin_centers": bin_centers}
                 for fam in families}
 
     for _, row in bed_df.iterrows():
@@ -186,34 +198,36 @@ def extract_positional_profiles(
 
         profiles[fam]["n_loci"] += 1
 
-        for read in bam.fetch(row["chrom"], te_start, te_stop):
+        # Fetch from extended region (TE + flanks)
+        flank_bp = int(te_len * flank_frac)
+        fetch_start = max(0, te_start - flank_bp)
+        fetch_stop = te_stop + flank_bp
+
+        for read in bam.fetch(row["chrom"], fetch_start, fetch_stop):
             if read.is_unmapped or read.is_secondary or read.is_supplementary:
                 continue
 
-            # Read strand (read1 convention for paired-end)
-            if read.is_reverse:
-                read_strand = "-"
-            else:
-                read_strand = "+"
-            if read.is_paired and read.is_read2:
-                read_strand = "-" if read_strand == "+" else "+"
+            read_strand = _get_read_strand(read)
 
-            # Use the 5' end of the read (biological transcription start)
-            # For forward reads: reference_start is the 5' end
-            # For reverse reads: reference_end is the 5' end
+            # 5' end of the read
             if read.is_reverse:
                 read_pos = read.reference_end
             else:
                 read_pos = read.reference_start
 
+            # Map to relative coordinate: 0 = TE 5' end, 1 = TE 3' end
             rel_pos = (read_pos - te_start) / te_len
 
-            # Flip for minus-strand TEs so 0 = 5' end of TE
+            # Flip for minus-strand TEs
             if te_strand == "-":
                 rel_pos = 1.0 - rel_pos
 
-            rel_pos = np.clip(rel_pos, 0, 1 - 1e-9)
-            bin_idx = int(rel_pos * n_bins)
+            # Clip to plotting range
+            if rel_pos < range_start or rel_pos >= range_end:
+                continue
+
+            bin_idx = int((rel_pos - range_start) / (range_end - range_start) * total_bins)
+            bin_idx = min(bin_idx, total_bins - 1)
 
             if read_strand == te_strand:
                 profiles[fam]["sense"][bin_idx] += 1

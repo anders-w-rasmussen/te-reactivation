@@ -57,56 +57,50 @@ def plot_family_footprints(
 
         row = 0
 
-        # ---- Panel 1: Positional footprint with bg/fg overlay ----
+        # ---- Panel 1: Positional footprint with flanking regions ----
         if has_profiles:
             ax = axes[row]
             prof = profiles[fam_name]
             sense_prof = prof["sense"]
             antisense_prof = prof["antisense"]
             n_prof_loci = prof["n_loci"]
-            bin_centers = np.linspace(0, 1, len(sense_prof) + 1)
-            bin_centers = (bin_centers[:-1] + bin_centers[1:]) / 2
+            bin_centers = prof.get("bin_centers")
+            if bin_centers is None:
+                bin_centers = np.linspace(0, 1, len(sense_prof) + 1)
+                bin_centers = (bin_centers[:-1] + bin_centers[1:]) / 2
 
-            # Total signal (what we observe)
+            # Shade TE body region [0, 1]
+            ax.axvspan(0, 1, alpha=0.08, color="#333333", label="TE body")
+            ax.axvline(0, color="#333333", linewidth=1, linestyle="-", alpha=0.5)
+            ax.axvline(1, color="#333333", linewidth=1, linestyle="-", alpha=0.5)
+
+            # Signal
             ax.fill_between(bin_centers, sense_prof, alpha=0.4,
-                            color="#2166ac", label="Observed sense")
+                            color="#2166ac", label="Sense")
             ax.fill_between(bin_centers, -antisense_prof, alpha=0.4,
-                            color="#b2182b", label="Observed antisense")
+                            color="#b2182b", label="Antisense")
             ax.plot(bin_centers, sense_prof, color="#2166ac", linewidth=1.0)
             ax.plot(bin_centers, -antisense_prof, color="#b2182b", linewidth=1.0)
 
-            # Estimated background level from flanks (horizontal band)
-            if has_flanks:
-                flank_s = data.flank_sense_rates[f_idx]
-                flank_a = data.flank_antisense_rates[f_idx]
-                # Profile units: total reads in bin / n_loci (from extract_positional_profiles)
-                # If background is uniform across TE body, expected per-bin per-locus:
-                #   mean_flank_rate(reads/kb) * mean_length(kb) / n_bins
-                mean_len_kb = lengths_kb.mean()
-                n_profile_bins = len(sense_prof)
-                bg_sense_level = flank_s.mean() * mean_len_kb / n_profile_bins
-                bg_antisense_level = flank_a.mean() * mean_len_kb / n_profile_bins
-
-                ax.axhline(bg_sense_level, color="#2166ac", linestyle=":",
-                           linewidth=2, alpha=0.7, label="Flank bg (sense)")
-                ax.axhline(-bg_antisense_level, color="#b2182b", linestyle=":",
-                           linewidth=2, alpha=0.7, label="Flank bg (antisense)")
-
-                # Shade the foreground region (above background)
-                ax.fill_between(bin_centers,
-                                bg_sense_level,
-                                np.maximum(sense_prof, bg_sense_level),
-                                alpha=0.25, color="#ff7f0e",
-                                label="Foreground (excess)")
-
             ax.axhline(0, color="black", linewidth=0.5)
-            ax.text(0.02, 0.95, "5'", transform=ax.transAxes,
-                    fontsize=13, fontweight="bold", va="top", color="#333")
-            ax.text(0.95, 0.95, "3'", transform=ax.transAxes,
-                    fontsize=13, fontweight="bold", va="top", color="#333")
-            ax.set_ylabel("Mean reads per locus", fontsize=10)
-            ax.set_xlabel("Relative position within TE body", fontsize=10)
-            ax.set_title("Positional Footprint (observed = bg + fg)", fontsize=11)
+
+            # Labels
+            ax.text(0.0, 1.02, "5'", transform=ax.get_xaxis_transform(),
+                    fontsize=12, fontweight="bold", ha="center", color="#333")
+            ax.text(1.0, 1.02, "3'", transform=ax.get_xaxis_transform(),
+                    fontsize=12, fontweight="bold", ha="center", color="#333")
+
+            # Label flanks
+            x_min = bin_centers[0]
+            ax.text((x_min + 0) / 2, 0.95, "5' flank", transform=ax.get_xaxis_transform(),
+                    fontsize=9, ha="center", va="top", color="#666", style="italic")
+            x_max = bin_centers[-1]
+            ax.text((1 + x_max) / 2, 0.95, "3' flank", transform=ax.get_xaxis_transform(),
+                    fontsize=9, ha="center", va="top", color="#666", style="italic")
+
+            ax.set_ylabel("Mean reads per locus per bin", fontsize=10)
+            ax.set_xlabel("Relative position (0 = TE 5' end, 1 = TE 3' end)", fontsize=10)
+            ax.set_title("Positional Footprint with Flanking Regions", fontsize=11)
             ax.legend(fontsize=7, loc="upper right", ncol=2)
             row += 1
 
