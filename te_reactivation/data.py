@@ -91,6 +91,81 @@ def aggregate_by_family(bed_df: pd.DataFrame) -> TEFamilyData:
     )
 
 
+def extract_positional_profiles(
+    bam_path: str,
+    bed_df: pd.DataFrame,
+    n_bins: int = 50,
+) -> dict[str, dict]:
+    """
+    Extract positional read profiles across the TE body for each family.
+
+    For each read, maps its start position to a relative coordinate [0, 1]
+    within the TE locus (0 = 5' end, 1 = 3' end, respecting TE strand).
+    Aggregates across all loci per family.
+
+    Returns dict: family_name -> {"sense": array[n_bins], "antisense": array[n_bins], "n_loci": int}
+    """
+    import pysam
+
+    bam = pysam.AlignmentFile(bam_path, "rb")
+    bins = np.linspace(0, 1, n_bins + 1)
+
+    # Accumulate per-family
+    families = bed_df["te_family"].unique()
+    profiles = {fam: {"sense": np.zeros(n_bins), "antisense": np.zeros(n_bins), "n_loci": 0}
+                for fam in families}
+
+    for _, row in bed_df.iterrows():
+        fam = row["te_family"]
+        te_start = row["start"]
+        te_stop = row["stop"]
+        te_strand = row["strand"]
+        te_len = te_stop - te_start
+        if te_len <= 0:
+            continue
+
+        profiles[fam]["n_loci"] += 1
+
+        for read in bam.fetch(row["chrom"], te_start, te_stop):
+            if read.is_unmapped or read.is_secondary or read.is_supplementary:
+                continue
+
+            # Read strand (read1 convention for paired-end)
+            if read.is_reverse:
+                read_strand = "-"
+            else:
+                read_strand = "+"
+            if read.is_paired and read.is_read2:
+                read_strand = "-" if read_strand == "+" else "+"
+
+            # Read start position relative to TE
+            read_pos = read.reference_start
+            rel_pos = (read_pos - te_start) / te_len
+
+            # Flip for minus-strand TEs so 0 = 5' end
+            if te_strand == "-":
+                rel_pos = 1.0 - rel_pos
+
+            rel_pos = np.clip(rel_pos, 0, 1 - 1e-9)
+            bin_idx = int(rel_pos * n_bins)
+
+            if read_strand == te_strand:
+                profiles[fam]["sense"][bin_idx] += 1
+            else:
+                profiles[fam]["antisense"][bin_idx] += 1
+
+    bam.close()
+
+    # Normalize by number of loci so profiles are comparable across families
+    for fam in profiles:
+        n = profiles[fam]["n_loci"]
+        if n > 0:
+            profiles[fam]["sense"] /= n
+            profiles[fam]["antisense"] /= n
+
+    return profiles
+
+
 def generate_synthetic_data(
     n_families: int = 20,
     n_loci_per_family: int = 50,

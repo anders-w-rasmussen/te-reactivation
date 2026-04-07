@@ -57,8 +57,12 @@ def main():
             print(f"\nResults written to {args.output}")
 
         if args.plots:
+            from .data import extract_positional_profiles
             from .plotting import plot_summary
-            plot_summary(data, results, threshold=args.threshold, save_dir=args.plots)
+            print("Extracting positional profiles from BAM (for footprint plots)...")
+            profiles = extract_positional_profiles(args.bam, bed_df)
+            plot_summary(data, results, threshold=args.threshold,
+                         save_dir=args.plots, profiles=profiles)
 
     elif args.command == "synthetic":
         from .data import generate_synthetic_data

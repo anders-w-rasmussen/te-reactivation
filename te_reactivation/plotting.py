@@ -16,62 +16,95 @@ from .data import TEFamilyData
 def plot_footprints(
     data: TEFamilyData,
     results: dict,
+    profiles: dict = None,
     top_n: int = 6,
     n_bins: int = 50,
     save_path: str = None,
 ):
     """
-    Plot aggregate sense/antisense coverage profiles across the TE body
-    for the top reactivated families, analogous to ATAC-seq footprint plots.
+    Plot positional sense/antisense coverage across the TE body.
 
-    Each TE locus is normalized to relative position [0, 1], then
-    sense and antisense counts are binned to show the coverage shape.
+    If `profiles` is provided (from extract_positional_profiles), shows
+    the real positional footprint — a 5' peak in sense = autonomous promoter.
+    Otherwise falls back to locus-level count view.
     """
     z = results["z_posterior"]
     names = results["family_names"]
     order = np.argsort(-z)
 
-    # Select top families
     top_idx = [i for i in order if z[i] > 0.01][:top_n]
     if len(top_idx) == 0:
         print("No families with P(reactivated) > 0.01 to plot.")
         return
 
     n_plots = len(top_idx)
-    fig, axes = plt.subplots(n_plots, 1, figsize=(8, 3 * n_plots), squeeze=False)
+    fig, axes = plt.subplots(n_plots, 1, figsize=(10, 3.5 * n_plots), squeeze=False)
 
-    bins = np.linspace(0, 1, n_bins + 1)
-    bin_centers = (bins[:-1] + bins[1:]) / 2
+    bin_centers = np.linspace(0, 1, n_bins + 1)
+    bin_centers = (bin_centers[:-1] + bin_centers[1:]) / 2
 
     for row, f_idx in enumerate(top_idx):
         ax = axes[row, 0]
-        sense = data.sense_counts[f_idx]
-        antisense = data.antisense_counts[f_idx]
-        lengths = data.locus_lengths[f_idx]
+        fam_name = names[f_idx]
 
-        # We don't have per-base coverage, but we can show per-locus
-        # counts as a bar chart sorted by locus position within TE body.
-        # For a true footprint, we'd need BAM read positions.
-        # Here we show the distribution of counts across loci as a proxy.
+        if profiles and fam_name in profiles:
+            # Real positional footprint
+            prof = profiles[fam_name]
+            sense_prof = prof["sense"]
+            antisense_prof = prof["antisense"]
+            n_loci = prof["n_loci"]
 
-        # Sort loci by sense count to show expression landscape
-        locus_order = np.argsort(-sense)
-        n_loci = len(sense)
-        x = np.arange(n_loci)
+            # Resize if different n_bins
+            if len(sense_prof) != n_bins:
+                from numpy import interp
+                x_old = np.linspace(0, 1, len(sense_prof))
+                x_new = bin_centers
+                sense_prof = interp(x_new, x_old, sense_prof)
+                antisense_prof = interp(x_new, x_old, antisense_prof)
 
-        ax.bar(x, sense[locus_order], width=1.0, alpha=0.7,
-               color="#2166ac", label="Sense")
-        ax.bar(x, -antisense[locus_order], width=1.0, alpha=0.7,
-               color="#b2182b", label="Antisense")
+            ax.fill_between(bin_centers, sense_prof, alpha=0.6,
+                            color="#2166ac", label="Sense")
+            ax.fill_between(bin_centers, -antisense_prof, alpha=0.6,
+                            color="#b2182b", label="Antisense")
+            ax.plot(bin_centers, sense_prof, color="#2166ac", linewidth=1.2)
+            ax.plot(bin_centers, -antisense_prof, color="#b2182b", linewidth=1.2)
 
-        ax.set_title(f"{names[f_idx]}  —  P(reactivated) = {z[f_idx]:.3f}",
-                     fontsize=11, fontweight="bold")
-        ax.set_ylabel("Read count")
-        ax.axhline(0, color="black", linewidth=0.5)
+            ax.axhline(0, color="black", linewidth=0.5)
+            ax.set_title(
+                f"{fam_name}  —  P(reactivated) = {z[f_idx]:.3f}  "
+                f"({n_loci} loci)",
+                fontsize=11, fontweight="bold",
+            )
+            ax.set_ylabel("Mean reads per locus")
+
+            # Mark 5' and 3' ends
+            ax.text(0.02, 0.95, "5'", transform=ax.transAxes,
+                    fontsize=12, fontweight="bold", va="top", color="#333333")
+            ax.text(0.95, 0.95, "3'", transform=ax.transAxes,
+                    fontsize=12, fontweight="bold", va="top", color="#333333")
+
+            if row == n_plots - 1:
+                ax.set_xlabel("Relative position within TE body")
+
+        else:
+            # Fallback: locus-level view
+            sense = data.sense_counts[f_idx]
+            antisense = data.antisense_counts[f_idx]
+            locus_order = np.argsort(-sense)
+            x = np.arange(len(sense))
+
+            ax.bar(x, sense[locus_order], width=1.0, alpha=0.7,
+                   color="#2166ac", label="Sense")
+            ax.bar(x, -antisense[locus_order], width=1.0, alpha=0.7,
+                   color="#b2182b", label="Antisense")
+            ax.axhline(0, color="black", linewidth=0.5)
+            ax.set_title(f"{fam_name}  —  P(reactivated) = {z[f_idx]:.3f}",
+                         fontsize=11, fontweight="bold")
+            ax.set_ylabel("Read count")
+            if row == n_plots - 1:
+                ax.set_xlabel("Loci (sorted by sense count)")
+
         ax.legend(loc="upper right", fontsize=8)
-
-        if row == n_plots - 1:
-            ax.set_xlabel("Loci (sorted by sense count)")
 
     plt.tight_layout()
     if save_path:
@@ -212,19 +245,22 @@ def plot_summary(
     results: dict,
     threshold: float = 0.5,
     save_dir: str = None,
+    profiles: dict = None,
 ):
     """Generate all plots. If save_dir is given, saves PNGs there."""
     import os
 
     if save_dir:
         os.makedirs(save_dir, exist_ok=True)
-        plot_footprints(data, results, save_path=os.path.join(save_dir, "footprints.png"))
+        plot_footprints(data, results, profiles=profiles,
+                        save_path=os.path.join(save_dir, "footprints.png"))
         plot_volcano(results, threshold, save_path=os.path.join(save_dir, "volcano.png"))
-        plot_sense_antisense(data, results, threshold, save_path=os.path.join(save_dir, "sense_antisense.png"))
+        plot_sense_antisense(data, results, threshold,
+                             save_path=os.path.join(save_dir, "sense_antisense.png"))
         plot_elbo(results, save_path=os.path.join(save_dir, "elbo.png"))
         print(f"\nAll plots saved to {save_dir}/")
     else:
-        plot_footprints(data, results)
+        plot_footprints(data, results, profiles=profiles)
         plot_volcano(results, threshold)
         plot_sense_antisense(data, results, threshold)
         plot_elbo(results)
