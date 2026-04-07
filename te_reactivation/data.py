@@ -15,7 +15,10 @@ class TEFamilyData:
     sense_counts: list[np.ndarray]      # sense_counts[f] = array of counts per locus in family f
     antisense_counts: list[np.ndarray]  # antisense_counts[f] = array per locus
     locus_lengths: list[np.ndarray]     # lengths in bp per locus
-    n_families: int
+    # Flank-based background (per-locus expected rate from local genomic context)
+    flank_sense_rates: list[np.ndarray] | None = None   # reads per kb in flanks, per locus
+    flank_antisense_rates: list[np.ndarray] | None = None
+    n_families: int = 0
 
 
 def load_bed(bed_path: str) -> pd.DataFrame:
@@ -29,43 +32,91 @@ def load_bed(bed_path: str) -> pd.DataFrame:
     return df
 
 
-def count_reads_from_bam(bam_path: str, bed_df: pd.DataFrame) -> pd.DataFrame:
-    """Count sense and antisense reads overlapping each TE locus from a BAM file."""
+def _get_read_strand(read) -> str:
+    """Get strand of a read using read1 convention for paired-end."""
+    if read.is_reverse:
+        strand = "-"
+    else:
+        strand = "+"
+    if read.is_paired and read.is_read2:
+        strand = "-" if strand == "+" else "+"
+    return strand
+
+
+def _count_region(bam, chrom, start, stop, te_strand):
+    """Count sense/antisense reads in a region relative to TE strand."""
+    s, a = 0, 0
+    if start < 0:
+        start = 0
+    try:
+        for read in bam.fetch(chrom, start, stop):
+            if read.is_unmapped or read.is_secondary or read.is_supplementary:
+                continue
+            if _get_read_strand(read) == te_strand:
+                s += 1
+            else:
+                a += 1
+    except ValueError:
+        pass  # region out of bounds
+    return s, a
+
+
+def count_reads_from_bam(
+    bam_path: str,
+    bed_df: pd.DataFrame,
+    flank_size: int = 2000,
+) -> pd.DataFrame:
+    """
+    Count sense/antisense reads in each TE locus AND in flanking regions.
+
+    Flanks: `flank_size` bp upstream and downstream of each TE.
+    Flank rates are normalized to reads per kb for use as local background.
+    """
     import pysam
 
     bam = pysam.AlignmentFile(bam_path, "rb")
     sense_counts = []
     antisense_counts = []
+    flank_sense_rates = []
+    flank_antisense_rates = []
 
-    for _, row in bed_df.iterrows():
-        s_count = 0
-        a_count = 0
+    total = len(bed_df)
+    for i, (_, row) in enumerate(bed_df.iterrows()):
+        if (i + 1) % 5000 == 0:
+            print(f"  Counting reads: {i+1}/{total} loci...")
+
         te_strand = row["strand"]
+        chrom = row["chrom"]
+        te_start = row["start"]
+        te_stop = row["stop"]
 
-        for read in bam.fetch(row["chrom"], row["start"], row["stop"]):
-            if read.is_unmapped or read.is_secondary or read.is_supplementary:
-                continue
-            # Determine read strand
-            if read.is_reverse:
-                read_strand = "-"
-            else:
-                read_strand = "+"
-            # For paired-end, use read1 strand convention
-            if read.is_paired and read.is_read2:
-                read_strand = "-" if read_strand == "+" else "+"
+        # TE body counts
+        s, a = _count_region(bam, chrom, te_start, te_stop, te_strand)
+        sense_counts.append(s)
+        antisense_counts.append(a)
 
-            if read_strand == te_strand:
-                s_count += 1
-            else:
-                a_count += 1
+        # Left flank
+        left_start = te_start - flank_size
+        left_s, left_a = _count_region(bam, chrom, left_start, te_start, te_strand)
 
-        sense_counts.append(s_count)
-        antisense_counts.append(a_count)
+        # Right flank
+        right_stop = te_stop + flank_size
+        right_s, right_a = _count_region(bam, chrom, te_stop, right_stop, te_strand)
+
+        # Combined flank rate (reads per kb)
+        total_flank_bp = flank_size * 2
+        flank_s_rate = (left_s + right_s) / (total_flank_bp / 1000) if total_flank_bp > 0 else 0
+        flank_a_rate = (left_a + right_a) / (total_flank_bp / 1000) if total_flank_bp > 0 else 0
+
+        flank_sense_rates.append(flank_s_rate)
+        flank_antisense_rates.append(flank_a_rate)
 
     bam.close()
     bed_df = bed_df.copy()
     bed_df["sense_count"] = sense_counts
     bed_df["antisense_count"] = antisense_counts
+    bed_df["flank_sense_rate"] = flank_sense_rates
+    bed_df["flank_antisense_rate"] = flank_antisense_rates
     return bed_df
 
 
@@ -75,18 +126,27 @@ def aggregate_by_family(bed_df: pd.DataFrame) -> TEFamilyData:
     sense = []
     antisense = []
     lengths = []
+    flank_s = []
+    flank_a = []
+
+    has_flanks = "flank_sense_rate" in bed_df.columns
 
     for fam in families:
         sub = bed_df[bed_df["te_family"] == fam]
         sense.append(sub["sense_count"].values.astype(np.float32))
         antisense.append(sub["antisense_count"].values.astype(np.float32))
         lengths.append(sub["length"].values.astype(np.float32))
+        if has_flanks:
+            flank_s.append(sub["flank_sense_rate"].values.astype(np.float32))
+            flank_a.append(sub["flank_antisense_rate"].values.astype(np.float32))
 
     return TEFamilyData(
         family_names=families,
         sense_counts=sense,
         antisense_counts=antisense,
         locus_lengths=lengths,
+        flank_sense_rates=flank_s if has_flanks else None,
+        flank_antisense_rates=flank_a if has_flanks else None,
         n_families=len(families),
     )
 
@@ -180,8 +240,9 @@ def generate_synthetic_data(
 
     Returns (data, ground_truth_z) where ground_truth_z[f] = 1 if family f is reactivated.
 
-    Background model: low-level random expression, roughly symmetric sense/antisense.
-    Foreground model: elevated sense expression + correlated antisense (dsRNA).
+    Background: varies per locus (simulates different genomic contexts).
+    Flanks match background (read-through affects TE body and flanks equally).
+    Foreground: excess expression in TE body ONLY (not flanks).
     """
     rng = np.random.default_rng(seed)
 
@@ -194,19 +255,28 @@ def generate_synthetic_data(
     sense_counts = []
     antisense_counts = []
     locus_lengths = []
+    flank_sense_rates = []
+    flank_antisense_rates = []
 
     for f in range(n_families):
         n_loci = rng.integers(max(10, n_loci_per_family // 2), n_loci_per_family * 2)
         lengths = rng.integers(200, 8000, size=n_loci).astype(np.float32)
 
-        # Background: low-level Poisson noise, roughly symmetric
-        bg_sense = rng.poisson(bg_rate, size=n_loci)
-        bg_antisense = rng.poisson(bg_rate * 0.8, size=n_loci)
+        # Per-locus background rate (varies — some loci near active genes, some not)
+        locus_bg_rate = rng.gamma(2.0, bg_rate / 2.0, size=n_loci)
+
+        # Background counts in TE body
+        bg_sense = rng.poisson(locus_bg_rate)
+        bg_antisense = rng.poisson(locus_bg_rate * 0.8)
+
+        # Flank rates match background (read-through = same rate in flanks and TE body)
+        # Add some noise to simulate imperfect flank estimation
+        flank_s = (locus_bg_rate + rng.normal(0, 0.3, size=n_loci)).clip(0.1)
+        flank_a = (locus_bg_rate * 0.8 + rng.normal(0, 0.3, size=n_loci)).clip(0.1)
 
         if z_true[f] == 1.0:
-            # Foreground: elevated sense from TE promoter
-            # Not all loci in an active family are necessarily active
-            locus_activity = rng.beta(2, 3, size=n_loci)  # heterogeneous activation
+            # Foreground: excess in TE body only, NOT in flanks
+            locus_activity = rng.beta(2, 3, size=n_loci)
             fg_sense = rng.poisson(fg_boost * locus_activity)
             fg_antisense = rng.poisson(fg_boost * antisense_ratio_active * locus_activity)
             sense = (bg_sense + fg_sense).astype(np.float32)
@@ -218,12 +288,16 @@ def generate_synthetic_data(
         sense_counts.append(sense)
         antisense_counts.append(antisense)
         locus_lengths.append(lengths)
+        flank_sense_rates.append(flank_s.astype(np.float32))
+        flank_antisense_rates.append(flank_a.astype(np.float32))
 
     data = TEFamilyData(
         family_names=families,
         sense_counts=sense_counts,
         antisense_counts=antisense_counts,
         locus_lengths=locus_lengths,
+        flank_sense_rates=flank_sense_rates,
+        flank_antisense_rates=flank_antisense_rates,
         n_families=n_families,
     )
     return data, z_true

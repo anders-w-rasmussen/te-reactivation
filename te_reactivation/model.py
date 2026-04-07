@@ -1,14 +1,12 @@
 """
 Bayesian model for autonomous TE reactivation detection.
 
-Analogy to ATAC-seq footprinting:
-- Background (slab): read-through / genomic noise — SHARED across families
-- Foreground (spike): autonomous TE transcription — family-specific, gated by z_f
-- Continuous spike-and-slab via sigmoid(logit_z) with shared background
+Background is estimated per-locus from flanking regions (2kb up/downstream).
+This captures local genomic context: a TE in a highly expressed gene will have
+high flanks too, so only excess expression above the local background is signal.
 
-Key insight: background read-through rate is a property of the genomic context,
-not the TE family. Sharing it forces the model to use the foreground component
-to explain excess expression in reactivated families.
+Foreground (spike-and-slab at family level): autonomous TE transcription that
+appears in the TE body but NOT in the flanks.
 """
 
 import torch
@@ -16,33 +14,37 @@ import pyro
 import pyro.distributions as dist
 
 
-def te_reactivation_model(sense_counts, antisense_counts, locus_lengths, n_families):
+def te_reactivation_model(sense_counts, antisense_counts, locus_lengths, n_families,
+                           flank_sense_rates=None, flank_antisense_rates=None):
     """
-    Generative model for TE family reactivation.
+    Generative model with flank-based per-locus background.
 
-    Uses continuous relaxation of spike-and-slab (sigmoid of logit_z)
-    to avoid the 64-dim limit of parallel enumeration. Shared background
-    provides identifiability.
+    Per locus i in family f:
+      expected_bg_sense_i = flank_sense_rate_i * length_kb_i
+      expected_bg_antisense_i = flank_antisense_rate_i * length_kb_i
+
+    The model asks: does the TE body have excess expression over what
+    the flanking regions predict?
     """
 
     # ---- Global priors ----
     pi = pyro.sample("pi", dist.Beta(2.0, 8.0))
     inv_disp = pyro.sample("inv_disp", dist.Gamma(3.0, 1.0))
 
-    # SHARED background rates (per-kb) — same for all families
-    log_bg_sense = pyro.sample("log_bg_sense", dist.Normal(0.0, 1.0))
-    log_bg_antisense = pyro.sample("log_bg_antisense", dist.Normal(0.0, 1.0))
+    # Background scaling factor — allows the model to learn that TE bodies
+    # have slightly different baseline rates than flanks (e.g. mappability)
+    bg_scale = pyro.sample("bg_scale", dist.LogNormal(0.0, 0.5))
 
     # ---- Per-family parameters ----
     with pyro.plate("families", n_families):
-        # Continuous spike-and-slab: logit_z → sigmoid → soft gate
+        # Continuous spike-and-slab
         logit_z = pyro.sample("logit_z", dist.Normal(
             torch.logit(pi).expand(n_families),
             torch.ones(n_families) * 1.5,
         ))
         z = torch.sigmoid(logit_z)
 
-        # Foreground magnitude and antisense ratio
+        # Foreground magnitude (excess over background)
         log_fg = pyro.sample("log_fg", dist.Normal(
             torch.ones(n_families) * 2.0,
             torch.ones(n_families) * 1.5,
@@ -57,13 +59,21 @@ def te_reactivation_model(sense_counts, antisense_counts, locus_lengths, n_famil
         n_loci = sense_counts[f].shape[0]
         lengths_kb = locus_lengths[f] / 1000.0
 
-        bg_sense_rate = torch.exp(log_bg_sense) * lengths_kb
-        bg_antisense_rate = torch.exp(log_bg_antisense) * lengths_kb
+        # Per-locus background from flanks
+        if flank_sense_rates is not None:
+            bg_sense_rate = bg_scale * flank_sense_rates[f] * lengths_kb + 1e-6
+            bg_antisense_rate = bg_scale * flank_antisense_rates[f] * lengths_kb + 1e-6
+        else:
+            # Fallback: uniform background if no flanks available
+            bg_sense_rate = bg_scale * lengths_kb + 1e-6
+            bg_antisense_rate = bg_scale * lengths_kb + 1e-6
+
+        # Foreground: excess from autonomous transcription
         fg_sense_rate = z[f] * torch.exp(log_fg[f]) * lengths_kb
         fg_antisense_rate = z[f] * torch.exp(log_fg[f]) * antisense_ratio[f] * lengths_kb
 
-        mu_sense = bg_sense_rate + fg_sense_rate + 1e-6
-        mu_antisense = bg_antisense_rate + fg_antisense_rate + 1e-6
+        mu_sense = bg_sense_rate + fg_sense_rate
+        mu_antisense = bg_antisense_rate + fg_antisense_rate
 
         with pyro.plate(f"loci_{f}", n_loci):
             pyro.sample(
@@ -84,8 +94,9 @@ def te_reactivation_model(sense_counts, antisense_counts, locus_lengths, n_famil
             )
 
 
-def te_reactivation_guide(sense_counts, antisense_counts, locus_lengths, n_families):
-    """Mean-field variational guide for continuous spike-and-slab."""
+def te_reactivation_guide(sense_counts, antisense_counts, locus_lengths, n_families,
+                           flank_sense_rates=None, flank_antisense_rates=None):
+    """Mean-field variational guide."""
 
     # Global params
     pi_alpha = pyro.param("pi_alpha", torch.tensor(2.0),
@@ -100,18 +111,12 @@ def te_reactivation_guide(sense_counts, antisense_counts, locus_lengths, n_famil
                                constraint=dist.constraints.positive)
     pyro.sample("inv_disp", dist.Gamma(inv_disp_alpha, inv_disp_beta))
 
-    # Shared background
-    loc_bg_s = pyro.param("loc_bg_s", torch.tensor(0.0))
-    scale_bg_s = pyro.param("scale_bg_s", torch.tensor(0.5),
-                            constraint=dist.constraints.positive)
-    pyro.sample("log_bg_sense", dist.Normal(loc_bg_s, scale_bg_s))
+    bg_scale_loc = pyro.param("bg_scale_loc", torch.tensor(0.0))
+    bg_scale_scale = pyro.param("bg_scale_scale", torch.tensor(0.3),
+                                constraint=dist.constraints.positive)
+    pyro.sample("bg_scale", dist.LogNormal(bg_scale_loc, bg_scale_scale))
 
-    loc_bg_a = pyro.param("loc_bg_a", torch.tensor(0.0))
-    scale_bg_a = pyro.param("scale_bg_a", torch.tensor(0.5),
-                            constraint=dist.constraints.positive)
-    pyro.sample("log_bg_antisense", dist.Normal(loc_bg_a, scale_bg_a))
-
-    # Per-family params (vectorized)
+    # Per-family params
     logit_z_loc = pyro.param("logit_z_loc", torch.zeros(n_families))
     logit_z_scale = pyro.param("logit_z_scale", torch.ones(n_families) * 0.5,
                                 constraint=dist.constraints.positive)

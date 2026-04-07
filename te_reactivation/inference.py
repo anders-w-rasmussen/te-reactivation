@@ -1,9 +1,9 @@
 """
 SVI inference for the TE reactivation model.
 
-Strategy: fit continuous relaxation via Trace_ELBO to learn shared background,
-foreground magnitudes, and dispersion. Then compute discrete P(z_f=1 | data)
-post-hoc via log-likelihood ratios. This scales to any number of families.
+Uses Trace_ELBO with continuous spike-and-slab, then computes discrete
+P(z_f=1 | data) post-hoc via log-likelihood ratios comparing TE body
+expression to flank-based background.
 """
 
 import torch
@@ -22,7 +22,14 @@ def prepare_tensors(data: TEFamilyData):
     sense = [torch.tensor(s, dtype=torch.float32) for s in data.sense_counts]
     antisense = [torch.tensor(a, dtype=torch.float32) for a in data.antisense_counts]
     lengths = [torch.tensor(l, dtype=torch.float32) for l in data.locus_lengths]
-    return sense, antisense, lengths
+
+    flank_s = None
+    flank_a = None
+    if data.flank_sense_rates is not None:
+        flank_s = [torch.tensor(f, dtype=torch.float32) for f in data.flank_sense_rates]
+        flank_a = [torch.tensor(f, dtype=torch.float32) for f in data.flank_antisense_rates]
+
+    return sense, antisense, lengths, flank_s, flank_a
 
 
 def run_svi(
@@ -36,20 +43,21 @@ def run_svi(
     """
     pyro.clear_param_store()
 
-    sense, antisense, lengths = prepare_tensors(data)
+    sense, antisense, lengths, flank_s, flank_a = prepare_tensors(data)
 
     optimizer = ClippedAdam({"lr": lr, "betas": (0.9, 0.999)})
     svi = SVI(te_reactivation_model, te_reactivation_guide, optimizer, loss=Trace_ELBO())
 
     losses = []
     for step in range(n_steps):
-        loss = svi.step(sense, antisense, lengths, data.n_families)
+        loss = svi.step(sense, antisense, lengths, data.n_families, flank_s, flank_a)
         losses.append(loss)
         if print_every and (step + 1) % print_every == 0:
             print(f"Step {step+1:>5d} | ELBO loss: {loss:>10.1f}")
 
     # Compute discrete posteriors via log-likelihood ratio
-    z_posterior = _compute_z_posteriors(sense, antisense, lengths, data.n_families)
+    z_posterior = _compute_z_posteriors(sense, antisense, lengths, data.n_families,
+                                        flank_s, flank_a)
 
     params = {}
     for name in pyro.get_param_store():
@@ -64,26 +72,23 @@ def run_svi(
 
 
 @torch.no_grad()
-def _compute_z_posteriors(sense, antisense, lengths, n_families, n_mc=200):
+def _compute_z_posteriors(sense, antisense, lengths, n_families,
+                           flank_s, flank_a, n_mc=200):
     """
     Compute P(z_f=1 | data) for each family via log-likelihood ratio.
-
-    For each MC sample of continuous params from the guide:
-      - Evaluate log p(data_f | z=0, theta) vs log p(data_f | z=1, theta)
-      - Combine with prior odds
-    Average log-odds across MC samples, convert to probability.
+    Compares TE body expression under z=0 (flank background only) vs
+    z=1 (flank background + autonomous foreground).
     """
     log_odds_samples = np.zeros((n_mc, n_families))
 
     for s in range(n_mc):
         guide_trace = pyro.poutine.trace(te_reactivation_guide).get_trace(
-            sense, antisense, lengths, n_families
+            sense, antisense, lengths, n_families, flank_s, flank_a
         )
 
         pi = guide_trace.nodes["pi"]["value"]
         inv_disp = guide_trace.nodes["inv_disp"]["value"]
-        log_bg_s = guide_trace.nodes["log_bg_sense"]["value"]
-        log_bg_a = guide_trace.nodes["log_bg_antisense"]["value"]
+        bg_scale = guide_trace.nodes["bg_scale"]["value"]
         log_fg = guide_trace.nodes["log_fg"]["value"]
         ar = guide_trace.nodes["antisense_ratio"]["value"]
 
@@ -92,15 +97,21 @@ def _compute_z_posteriors(sense, antisense, lengths, n_families, n_mc=200):
         for f in range(n_families):
             lengths_kb = lengths[f] / 1000.0
 
-            bg_s = torch.exp(log_bg_s) * lengths_kb
-            bg_a = torch.exp(log_bg_a) * lengths_kb
+            # Per-locus background from flanks
+            if flank_s is not None:
+                bg_s = bg_scale * flank_s[f] * lengths_kb + 1e-6
+                bg_a = bg_scale * flank_a[f] * lengths_kb + 1e-6
+            else:
+                bg_s = bg_scale * lengths_kb + 1e-6
+                bg_a = bg_scale * lengths_kb + 1e-6
+
             fg_s = torch.exp(log_fg[f]) * lengths_kb
             fg_a = torch.exp(log_fg[f]) * ar[f] * lengths_kb
 
-            mu_s_0 = bg_s + 1e-6
-            mu_a_0 = bg_a + 1e-6
-            mu_s_1 = bg_s + fg_s + 1e-6
-            mu_a_1 = bg_a + fg_a + 1e-6
+            mu_s_0 = bg_s
+            mu_a_0 = bg_a
+            mu_s_1 = bg_s + fg_s
+            mu_a_1 = bg_a + fg_a
 
             ll_0 = (
                 dist.GammaPoisson(inv_disp, inv_disp / mu_s_0).log_prob(sense[f]).sum()
