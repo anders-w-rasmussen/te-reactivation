@@ -1,9 +1,8 @@
 """
-SVI inference for the TE reactivation model.
+SVI inference for the hierarchical TE reactivation model.
 
-Uses Trace_ELBO with continuous spike-and-slab, then computes discrete
-P(z_f=1 | data) post-hoc via log-likelihood ratios comparing TE body
-expression to flank-based background.
+Post-hoc discrete posteriors marginalize over locus-level scaling w_fi
+by fixing them at their variational means during the LL ratio computation.
 """
 
 import torch
@@ -38,9 +37,6 @@ def run_svi(
     lr: float = 0.005,
     print_every: int = 500,
 ) -> dict:
-    """
-    Run stochastic variational inference, then compute discrete posteriors.
-    """
     pyro.clear_param_store()
 
     sense, antisense, lengths, flank_s, flank_a = prepare_tensors(data)
@@ -55,7 +51,7 @@ def run_svi(
         if print_every and (step + 1) % print_every == 0:
             print(f"Step {step+1:>5d} | ELBO loss: {loss:>10.1f}")
 
-    # Compute discrete posteriors via log-likelihood ratio
+    # Compute discrete posteriors
     z_posterior = _compute_z_posteriors(sense, antisense, lengths, data.n_families,
                                         flank_s, flank_a)
 
@@ -75,9 +71,10 @@ def run_svi(
 def _compute_z_posteriors(sense, antisense, lengths, n_families,
                            flank_s, flank_a, n_mc=200):
     """
-    Compute P(z_f=1 | data) for each family via log-likelihood ratio.
-    Compares TE body expression under z=0 (flank background only) vs
-    z=1 (flank background + autonomous foreground).
+    Compute P(z_f=1 | data) via log-likelihood ratio.
+
+    Uses learned locus-level w_fi (at variational mean) so that
+    the LL ratio reflects the family-level effect, not individual hot loci.
     """
     log_odds_samples = np.zeros((n_mc, n_families))
 
@@ -97,7 +94,11 @@ def _compute_z_posteriors(sense, antisense, lengths, n_families,
         for f in range(n_families):
             lengths_kb = lengths[f] / 1000.0
 
-            # Per-locus background from flanks
+            # Locus-level scale from guide
+            log_w = guide_trace.nodes[f"log_w_{f}"]["value"]
+            w = torch.exp(log_w)
+
+            # Background
             if flank_s is not None:
                 bg_s = bg_scale * flank_s[f] * lengths_kb + 1e-6
                 bg_a = bg_scale * flank_a[f] * lengths_kb + 1e-6
@@ -105,8 +106,9 @@ def _compute_z_posteriors(sense, antisense, lengths, n_families,
                 bg_s = bg_scale * lengths_kb + 1e-6
                 bg_a = bg_scale * lengths_kb + 1e-6
 
-            fg_s = torch.exp(log_fg[f]) * lengths_kb
-            fg_a = torch.exp(log_fg[f]) * ar[f] * lengths_kb
+            # Foreground with locus scaling
+            fg_s = torch.exp(log_fg[f]) * w * lengths_kb
+            fg_a = torch.exp(log_fg[f]) * ar[f] * w * lengths_kb
 
             mu_s_0 = bg_s
             mu_a_0 = bg_a
@@ -134,30 +136,41 @@ def summarize_results(results: dict, threshold: float = 0.5) -> None:
     print("\n" + "=" * 60)
     print("TE Family Reactivation Results")
     print("=" * 60)
-    print(f"{'Family':<25s} {'P(reactivated)':>15s} {'Call':>8s}")
+    print(f"{'Family':<25s} {'P(reactivated)':>15s} {'sigma_w':>10s} {'Call':>8s}")
     print("-" * 60)
 
     z = results["z_posterior"]
     names = results["family_names"]
+    params = results["params"]
+
+    # sigma_w tells us about locus heterogeneity
+    sigma_w_loc = params.get("sigma_w_loc", np.zeros(len(z)))
 
     order = np.argsort(-z)
     for idx in order:
         call = "ACTIVE" if z[idx] >= threshold else "silent"
-        print(f"{names[idx]:<25s} {z[idx]:>15.3f} {call:>8s}")
+        print(f"{names[idx]:<25s} {z[idx]:>15.3f} {sigma_w_loc[idx]:>10.3f} {call:>8s}")
 
     n_active = (z >= threshold).sum()
     print("-" * 60)
     print(f"Total reactivated: {int(n_active)} / {len(z)} families (threshold={threshold})")
 
-    # Report antisense ratios for active families
-    params = results["params"]
+    # Report antisense ratios and sigma_w for active families
     ar_alpha = params.get("ar_alpha")
     ar_beta = params.get("ar_beta")
     if ar_alpha is not None:
         ar_mean = ar_alpha / (ar_alpha + ar_beta)
-        print(f"\n{'Family':<25s} {'P(react)':>10s} {'AS/S ratio':>12s} {'dsRNA?':>8s}")
-        print("-" * 60)
+        print(f"\n{'Family':<25s} {'P(react)':>10s} {'AS/S':>8s} {'sigma_w':>10s} {'Pattern':>12s}")
+        print("-" * 70)
         for idx in order:
             if z[idx] >= threshold:
-                dsrna = "yes" if ar_mean[idx] > 0.3 else "low"
-                print(f"{names[idx]:<25s} {z[idx]:>10.3f} {ar_mean[idx]:>12.3f} {dsrna:>8s}")
+                dsrna = "dsRNA" if ar_mean[idx] > 0.3 else "sense-only"
+                # sigma_w interpretation
+                if sigma_w_loc[idx] < 0.3:
+                    pattern = "uniform"
+                elif sigma_w_loc[idx] < 0.8:
+                    pattern = "moderate"
+                else:
+                    pattern = "focal"
+                print(f"{names[idx]:<25s} {z[idx]:>10.3f} {ar_mean[idx]:>8.3f} "
+                      f"{sigma_w_loc[idx]:>10.3f} {pattern:>12s}")
