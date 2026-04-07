@@ -25,6 +25,7 @@ def main():
     run_parser.add_argument("--lr", type=float, default=0.005, help="Learning rate (default: 0.005)")
     run_parser.add_argument("--threshold", type=float, default=0.5, help="Reactivation call threshold")
     run_parser.add_argument("--output", "-o", help="Output TSV path (optional)")
+    run_parser.add_argument("--plots", help="Directory to save plots (optional)")
 
     # ---- synthetic: validate on synthetic data ----
     synth_parser = subparsers.add_parser("synthetic", help="Run on synthetic data to validate model")
@@ -34,6 +35,7 @@ def main():
     synth_parser.add_argument("--steps", type=int, default=3000)
     synth_parser.add_argument("--lr", type=float, default=0.005)
     synth_parser.add_argument("--seed", type=int, default=42)
+    synth_parser.add_argument("--plots", help="Directory to save plots (optional)")
 
     args = parser.parse_args()
 
@@ -53,6 +55,10 @@ def main():
         if args.output:
             _write_output(results, args.output, args.threshold)
             print(f"\nResults written to {args.output}")
+
+        if args.plots:
+            from .plotting import plot_summary
+            plot_summary(data, results, threshold=args.threshold, save_dir=args.plots)
 
     elif args.command == "synthetic":
         from .data import generate_synthetic_data
@@ -88,6 +94,10 @@ def main():
         print(f"  Precision: {precision:.3f}")
         print(f"  Recall:    {recall:.3f}")
         print(f"  F1:        {f1:.3f}")
+
+        if args.plots:
+            from .plotting import plot_summary
+            plot_summary(data, results, save_dir=args.plots)
 
     else:
         parser.print_help()
