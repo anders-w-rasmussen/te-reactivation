@@ -79,12 +79,13 @@ def plot_family_footprints(
             if has_flanks:
                 flank_s = data.flank_sense_rates[f_idx]
                 flank_a = data.flank_antisense_rates[f_idx]
-                # Mean flank rate, converted to same units as profile
-                # Profile is mean reads per locus, flank is reads/kb
-                # Approximate: mean_length_kb * mean_flank_rate
+                # Profile units: total reads in bin / n_loci (from extract_positional_profiles)
+                # If background is uniform across TE body, expected per-bin per-locus:
+                #   mean_flank_rate(reads/kb) * mean_length(kb) / n_bins
                 mean_len_kb = lengths_kb.mean()
-                bg_sense_level = flank_s.mean() * mean_len_kb / max(n_prof_loci, 1)
-                bg_antisense_level = flank_a.mean() * mean_len_kb / max(n_prof_loci, 1)
+                n_profile_bins = len(sense_prof)
+                bg_sense_level = flank_s.mean() * mean_len_kb / n_profile_bins
+                bg_antisense_level = flank_a.mean() * mean_len_kb / n_profile_bins
 
                 ax.axhline(bg_sense_level, color="#2166ac", linestyle=":",
                            linewidth=2, alpha=0.7, label="Flank bg (sense)")
