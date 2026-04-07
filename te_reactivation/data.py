@@ -198,11 +198,17 @@ def extract_positional_profiles(
             if read.is_paired and read.is_read2:
                 read_strand = "-" if read_strand == "+" else "+"
 
-            # Read start position relative to TE
-            read_pos = read.reference_start
+            # Use the 5' end of the read (biological transcription start)
+            # For forward reads: reference_start is the 5' end
+            # For reverse reads: reference_end is the 5' end
+            if read.is_reverse:
+                read_pos = read.reference_end
+            else:
+                read_pos = read.reference_start
+
             rel_pos = (read_pos - te_start) / te_len
 
-            # Flip for minus-strand TEs so 0 = 5' end
+            # Flip for minus-strand TEs so 0 = 5' end of TE
             if te_strand == "-":
                 rel_pos = 1.0 - rel_pos
 
