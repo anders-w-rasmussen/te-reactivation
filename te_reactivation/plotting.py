@@ -84,6 +84,26 @@ def plot_family_footprints(
 
             ax.axhline(0, color="black", linewidth=0.5)
 
+            # Mean flank level as horizontal reference lines
+            # Computed from the flank bins in the profile itself
+            flank_mask = (bin_centers < 0) | (bin_centers > 1)
+            if flank_mask.any():
+                mean_flank_sense = sense_prof[flank_mask].mean()
+                mean_flank_antisense = antisense_prof[flank_mask].mean()
+                ax.axhline(mean_flank_sense, color="#2166ac", linestyle="--",
+                           linewidth=2, alpha=0.7, label=f"Flank mean sense ({mean_flank_sense:.3f})")
+                ax.axhline(-mean_flank_antisense, color="#b2182b", linestyle="--",
+                           linewidth=2, alpha=0.7, label=f"Flank mean antisense ({mean_flank_antisense:.3f})")
+
+                # Shade foreground excess above flank mean
+                te_mask = (bin_centers >= 0) & (bin_centers <= 1)
+                te_bins = bin_centers[te_mask]
+                te_sense = sense_prof[te_mask]
+                ax.fill_between(te_bins,
+                                mean_flank_sense,
+                                np.maximum(te_sense, mean_flank_sense),
+                                alpha=0.3, color="#ff7f0e", label="Excess over flank")
+
             # Labels
             ax.text(0.0, 1.02, "5'", transform=ax.get_xaxis_transform(),
                     fontsize=12, fontweight="bold", ha="center", color="#333")
