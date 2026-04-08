@@ -147,6 +147,110 @@ def extract_coverage(
     return result
 
 
+def extract_coverage_bam(
+    bam_path: str,
+    bed_df: pd.DataFrame,
+    n_bins: int = 100,
+    flank_frac: float = 0.5,
+    min_te_length: int = 50,
+) -> dict[str, dict]:
+    """
+    Extract per-base strand-specific coverage from a BAM file using
+    pysam.count_coverage(). Fast — uses the BAM index, doesn't iterate reads.
+
+    Returns same format as extract_coverage():
+    dict: family -> {"sense": (n_loci, total_bins), "antisense": ..., "bin_centers": ...}
+    """
+    import pysam
+
+    bam = pysam.AlignmentFile(bam_path, "rb")
+
+    flank_bins = int(n_bins * flank_frac)
+    total_bins = flank_bins + n_bins + flank_bins
+    range_start = -flank_frac
+    range_end = 1.0 + flank_frac
+    bin_centers = np.linspace(range_start, range_end, total_bins)
+
+    families = bed_df["te_family"].unique()
+    family_data = {fam: {"sense": [], "antisense": []} for fam in families}
+
+    # Get chrom lengths from BAM header
+    chrom_sizes = dict(zip(bam.references, bam.lengths))
+
+    total = len(bed_df)
+    for i, (_, row) in enumerate(bed_df.iterrows()):
+        if (i + 1) % 10000 == 0:
+            print(f"  Coverage extraction: {i+1}/{total} loci...")
+
+        te_len = row["stop"] - row["start"]
+        if te_len < min_te_length:
+            continue
+
+        chrom = row["chrom"]
+        if chrom not in chrom_sizes:
+            continue
+
+        chrom_len = chrom_sizes[chrom]
+        flank_bp = int(te_len * flank_frac)
+
+        ext_start = max(0, row["start"] - flank_bp)
+        ext_stop = min(chrom_len, row["stop"] + flank_bp)
+
+        try:
+            # count_coverage returns tuple of 4 arrays (A, C, G, T) per base
+            # We need to call it twice with strand filters
+
+            # Forward strand reads
+            fwd_counts = bam.count_coverage(
+                chrom, ext_start, ext_stop,
+                quality_threshold=0,
+                read_callback=lambda r: (not r.is_reverse and not r.is_secondary
+                                         and not r.is_supplementary),
+            )
+            fwd_vals = np.array(fwd_counts).sum(axis=0).astype(np.float32)
+
+            # Reverse strand reads
+            rev_counts = bam.count_coverage(
+                chrom, ext_start, ext_stop,
+                quality_threshold=0,
+                read_callback=lambda r: (r.is_reverse and not r.is_secondary
+                                         and not r.is_supplementary),
+            )
+            rev_vals = np.array(rev_counts).sum(axis=0).astype(np.float32)
+        except Exception:
+            continue
+
+        # Orient to TE strand
+        if row["strand"] == "+":
+            sense_vals = fwd_vals
+            antisense_vals = rev_vals
+        else:
+            sense_vals = rev_vals[::-1]
+            antisense_vals = fwd_vals[::-1]
+
+        sense_binned = _resize_to_bins(sense_vals, total_bins)
+        antisense_binned = _resize_to_bins(antisense_vals, total_bins)
+
+        family_data[row["te_family"]]["sense"].append(sense_binned)
+        family_data[row["te_family"]]["antisense"].append(antisense_binned)
+
+    bam.close()
+
+    result = {}
+    for fam in families:
+        s_list = family_data[fam]["sense"]
+        a_list = family_data[fam]["antisense"]
+        if len(s_list) == 0:
+            continue
+        result[fam] = {
+            "sense": np.stack(s_list),
+            "antisense": np.stack(a_list),
+            "bin_centers": bin_centers,
+        }
+
+    return result
+
+
 def _resize_to_bins(vals: np.ndarray, n_bins: int) -> np.ndarray:
     """Resize a per-base array to n_bins by mean-pooling."""
     n = len(vals)

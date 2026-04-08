@@ -38,10 +38,12 @@ def main():
     synth_parser.add_argument("--plots", help="Directory to save plots (optional)")
 
     # ---- footprint: bigWig-based footprinting ----
-    fp_parser = subparsers.add_parser("footprint", help="Generate TE footprint plots from bigWig files")
+    fp_parser = subparsers.add_parser("footprint", help="Generate TE footprint plots")
     fp_parser.add_argument("--bed", required=True, help="BED file: chrom start stop TE_family strand")
-    fp_parser.add_argument("--fwd-bw", required=True, help="Forward-strand bigWig (CPM normalized)")
-    fp_parser.add_argument("--rev-bw", required=True, help="Reverse-strand bigWig (CPM normalized)")
+    fp_input = fp_parser.add_mutually_exclusive_group(required=True)
+    fp_input.add_argument("--bam", help="BAM file (indexed) — slower but no preprocessing needed")
+    fp_input.add_argument("--fwd-bw", help="Forward-strand bigWig (use with --rev-bw)")
+    fp_parser.add_argument("--rev-bw", help="Reverse-strand bigWig (use with --fwd-bw)")
     fp_parser.add_argument("--out-dir", "-o", required=True, help="Output directory for plots")
     fp_parser.add_argument("--n-bins", type=int, default=100, help="Bins across TE body (default: 100)")
     fp_parser.add_argument("--flank-frac", type=float, default=0.5, help="Flank size as fraction of TE length (default: 0.5)")
@@ -50,18 +52,28 @@ def main():
     args = parser.parse_args()
 
     if args.command == "footprint":
-        from .footprint import load_bed as fp_load_bed, extract_coverage, compute_footprints, plot_footprints
+        from .footprint import load_bed as fp_load_bed, extract_coverage, extract_coverage_bam, compute_footprints, plot_footprints
+
+        if args.fwd_bw and not args.rev_bw:
+            parser.error("--fwd-bw requires --rev-bw")
 
         print(f"Loading BED: {args.bed}")
         bed_df = fp_load_bed(args.bed)
         n_fam = bed_df["te_family"].nunique()
         print(f"  {len(bed_df)} loci across {n_fam} families")
 
-        print(f"Extracting coverage from bigWigs...")
-        coverages = extract_coverage(
-            args.fwd_bw, args.rev_bw, bed_df,
-            n_bins=args.n_bins, flank_frac=args.flank_frac,
-        )
+        if args.bam:
+            print(f"Extracting coverage from BAM: {args.bam}")
+            coverages = extract_coverage_bam(
+                args.bam, bed_df,
+                n_bins=args.n_bins, flank_frac=args.flank_frac,
+            )
+        else:
+            print(f"Extracting coverage from bigWigs...")
+            coverages = extract_coverage(
+                args.fwd_bw, args.rev_bw, bed_df,
+                n_bins=args.n_bins, flank_frac=args.flank_frac,
+            )
         print(f"  Extracted {sum(v['sense'].shape[0] for v in coverages.values())} loci across {len(coverages)} families")
 
         print("Computing footprints...")
