@@ -22,6 +22,26 @@ import pandas as pd
 from dataclasses import dataclass, field
 
 
+def _resolve_chrom(chrom: str, valid_chroms: set) -> str | None:
+    """
+    Resolve chromosome name mismatches between files.
+    Tries the name as-is, with 'chr' prefix added, and with 'chr' prefix stripped.
+    Returns the matching name or None if no match found.
+    """
+    if chrom in valid_chroms:
+        return chrom
+    # Try adding chr
+    with_chr = f"chr{chrom}"
+    if with_chr in valid_chroms:
+        return with_chr
+    # Try stripping chr
+    if chrom.startswith("chr"):
+        without_chr = chrom[3:]
+        if without_chr in valid_chroms:
+            return without_chr
+    return None
+
+
 @dataclass
 class FamilyFootprint:
     """Aggregate footprint for one TE family."""
@@ -87,6 +107,7 @@ def extract_coverage(
     families = bed_df["te_family"].unique()
     family_data = {fam: {"sense": [], "antisense": []} for fam in families}
 
+    bw_chroms = set(bw_fwd.chroms().keys())
     chrom_sizes = dict(zip(bw_fwd.chroms().keys(), bw_fwd.chroms().values()))
 
     for _, row in bed_df.iterrows():
@@ -94,11 +115,11 @@ def extract_coverage(
         if te_len < min_te_length:
             continue
 
-        chrom = row["chrom"]
-        if chrom not in chrom_sizes:
+        bw_chrom = _resolve_chrom(row["chrom"], bw_chroms)
+        if bw_chrom is None:
             continue
 
-        chrom_len = chrom_sizes[chrom]
+        chrom_len = chrom_sizes[bw_chrom]
         flank_bp = int(te_len * flank_frac)
 
         # Extended region
@@ -107,8 +128,8 @@ def extract_coverage(
 
         # Get per-base coverage from both strands
         try:
-            fwd_vals = np.array(bw_fwd.values(chrom, ext_start, ext_stop), dtype=np.float32)
-            rev_vals = np.array(bw_rev.values(chrom, ext_start, ext_stop), dtype=np.float32)
+            fwd_vals = np.array(bw_fwd.values(bw_chrom, ext_start, ext_stop), dtype=np.float32)
+            rev_vals = np.array(bw_rev.values(bw_chrom, ext_start, ext_stop), dtype=np.float32)
         except Exception:
             continue
 
@@ -195,7 +216,9 @@ def extract_coverage_bam(
     family_data = {fam: {k: [] for k in keys}
                    for fam in families}
 
+    bam_chroms = set(bam.references)
     chrom_sizes = dict(zip(bam.references, bam.lengths))
+    map_chroms = set(map_bw.chroms().keys()) if map_bw else set()
 
     total = len(bed_df)
     for i, (_, row) in enumerate(bed_df.iterrows()):
@@ -206,11 +229,13 @@ def extract_coverage_bam(
         if te_len < min_te_length:
             continue
 
-        chrom = row["chrom"]
-        if chrom not in chrom_sizes:
+        # Resolve chrom name for BAM
+        bed_chrom = row["chrom"]
+        bam_chrom = _resolve_chrom(bed_chrom, bam_chroms)
+        if bam_chrom is None:
             continue
 
-        chrom_len = chrom_sizes[chrom]
+        chrom_len = chrom_sizes[bam_chrom]
         flank_bp = int(te_len * flank_frac)
         te_start = row["start"]
         te_stop = row["stop"]
@@ -226,7 +251,7 @@ def extract_coverage_bam(
         # --- Coverage via count_coverage (fast, index-based) ---
         try:
             fwd_counts = bam.count_coverage(
-                chrom, ext_start, ext_stop,
+                bam_chrom, ext_start, ext_stop,
                 quality_threshold=0,
                 read_callback=lambda r: (not r.is_reverse and not r.is_secondary
                                          and not r.is_supplementary),
@@ -234,7 +259,7 @@ def extract_coverage_bam(
             fwd_vals = np.array(fwd_counts).sum(axis=0).astype(np.float32)
 
             rev_counts = bam.count_coverage(
-                chrom, ext_start, ext_stop,
+                bam_chrom, ext_start, ext_stop,
                 quality_threshold=0,
                 read_callback=lambda r: (r.is_reverse and not r.is_secondary
                                          and not r.is_supplementary),
@@ -247,7 +272,7 @@ def extract_coverage_bam(
         fwd_5p = np.zeros(region_len, dtype=np.float32)
         rev_5p = np.zeros(region_len, dtype=np.float32)
 
-        for read in bam.fetch(chrom, ext_start, ext_stop):
+        for read in bam.fetch(bam_chrom, ext_start, ext_stop):
             if read.is_unmapped or read.is_secondary or read.is_supplementary:
                 continue
 
@@ -269,11 +294,15 @@ def extract_coverage_bam(
         # --- Mappability (if available) ---
         map_vals = None
         if map_bw:
-            try:
-                map_vals = np.array(map_bw.values(chrom, ext_start, ext_stop), dtype=np.float32)
-                map_vals = np.nan_to_num(map_vals, 0.0)
-            except Exception:
+            map_chrom = _resolve_chrom(bed_chrom, map_chroms)
+            if map_chrom is None:
                 map_vals = np.ones(region_len, dtype=np.float32)
+            else:
+                try:
+                    map_vals = np.array(map_bw.values(map_chrom, ext_start, ext_stop), dtype=np.float32)
+                    map_vals = np.nan_to_num(map_vals, 0.0)
+                except Exception:
+                    map_vals = np.ones(region_len, dtype=np.float32)
 
         # --- Orient to TE strand ---
         if te_strand == "+":
