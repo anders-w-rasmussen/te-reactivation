@@ -50,9 +50,49 @@ def main():
     fp_parser.add_argument("--mappability-bw", help="Mappability bigWig for background correction (e.g. k100.Umap.bw)")
     fp_parser.add_argument("--top-n", type=int, default=None, help="Only plot top N families by enrichment")
 
+    # ---- footprint-consensus: consensus-coordinate footprinting ----
+    fpc_parser = subparsers.add_parser("footprint-consensus",
+        help="Footprint using consensus coordinates from RepeatMasker .out")
+    fpc_parser.add_argument("--rm-out", required=True, help="RepeatMasker .out file")
+    fpc_parser.add_argument("--bam", required=True, help="BAM file (indexed)")
+    fpc_parser.add_argument("--out-dir", "-o", required=True, help="Output directory for plots")
+    fpc_parser.add_argument("--families", help="Comma-separated family names to plot (e.g. L1HS,L1PA2,L1PA6)")
+    fpc_parser.add_argument("--n-bins", type=int, default=200, help="Bins across consensus body (default: 200)")
+    fpc_parser.add_argument("--flank-bp", type=int, default=2000, help="Flank size in bp (default: 2000)")
+    fpc_parser.add_argument("--mappability-bw", help="Mappability bigWig")
+    fpc_parser.add_argument("--top-n", type=int, default=None, help="Only plot top N families")
+
     args = parser.parse_args()
 
-    if args.command == "footprint":
+    if args.command == "footprint-consensus":
+        from .footprint import load_repeatmasker_out, extract_coverage_consensus, compute_footprints, plot_footprints
+
+        print(f"Loading RepeatMasker .out: {args.rm_out}")
+        rm_df = load_repeatmasker_out(args.rm_out)
+        print(f"  {len(rm_df)} total TE loci, {rm_df['repeat_name'].nunique()} families")
+
+        family_filter = None
+        if args.families:
+            family_filter = [f.strip() for f in args.families.split(",")]
+            print(f"  Filtering to families: {family_filter}")
+
+        print(f"Extracting coverage in consensus coordinates...")
+        coverages = extract_coverage_consensus(
+            args.bam, rm_df,
+            family_filter=family_filter,
+            n_bins=args.n_bins,
+            flank_bp=args.flank_bp,
+            mappability_bw_path=getattr(args, 'mappability_bw', None),
+        )
+        print(f"  Extracted {sum(v['sense'].shape[0] for v in coverages.values())} loci across {len(coverages)} families")
+
+        print("Computing footprints...")
+        footprints = compute_footprints(coverages)
+
+        print(f"Plotting to {args.out_dir}/...")
+        plot_footprints(footprints, save_dir=args.out_dir, top_n=args.top_n)
+
+    elif args.command == "footprint":
         from .footprint import load_bed as fp_load_bed, extract_coverage, extract_coverage_bam, compute_footprints, plot_footprints
 
         if args.fwd_bw and not args.rev_bw:

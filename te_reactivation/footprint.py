@@ -73,6 +73,296 @@ def load_bed(bed_path: str) -> pd.DataFrame:
     )
 
 
+def load_repeatmasker_out(out_path: str) -> pd.DataFrame:
+    """
+    Parse RepeatMasker .out file.
+
+    Returns DataFrame with columns:
+        chrom, start, stop, strand, repeat_name, repeat_family,
+        rep_start, rep_end, rep_left
+    where rep_start/rep_end are positions in the consensus sequence.
+    """
+    rows = []
+    with open(out_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("SW") or line.startswith("-"):
+                continue
+            parts = line.split()
+            if len(parts) < 15:
+                continue
+            try:
+                chrom = parts[4]
+                start = int(parts[5]) - 1  # convert to 0-based
+                stop = int(parts[6])
+                strand = parts[8]
+                repeat_name = parts[9]
+                repeat_family = parts[10]
+
+                if strand == "+":
+                    rep_start = int(parts[11])
+                    rep_end = int(parts[12])
+                    rep_left = parts[13].strip("()")
+                else:
+                    # For complement strand, columns are reordered
+                    rep_left = parts[11].strip("()")
+                    rep_end = int(parts[12])
+                    rep_start = int(parts[13])
+                    strand = "-"
+
+                rows.append({
+                    "chrom": chrom, "start": start, "stop": stop,
+                    "strand": strand, "repeat_name": repeat_name,
+                    "repeat_family": repeat_family,
+                    "rep_start": rep_start, "rep_end": rep_end,
+                })
+            except (ValueError, IndexError):
+                continue
+
+    df = pd.DataFrame(rows)
+    # Consensus length = rep_end for + strand full-length copies, approximate
+    return df
+
+
+def extract_coverage_consensus(
+    bam_path: str,
+    rm_df: pd.DataFrame,
+    family_filter: list[str] = None,
+    consensus_length: int = None,
+    n_bins: int = 200,
+    flank_bp: int = 2000,
+    flank_bins: int = 50,
+    min_te_length: int = 50,
+    mappability_bw_path: str = None,
+) -> dict[str, dict]:
+    """
+    Extract coverage mapped to consensus coordinates.
+
+    Instead of normalizing each copy to [0,1], maps genomic positions
+    to the consensus position using RepeatMasker's rep_start/rep_end.
+    This way the promoter always lands at the same x-axis position.
+
+    flank_bp: fixed flanking region in genomic bp (not scaled to TE length).
+    consensus_length: if None, inferred from max rep_end per family.
+
+    Returns dict: family -> {
+        "sense": (n_loci, flank_bins + n_bins + flank_bins),
+        "antisense": ...,
+        "sense_5p": ...,
+        "antisense_5p": ...,
+        "mappability": ... (if provided),
+        "bin_centers": array (in consensus bp, with negative for 5' flank),
+    }
+    """
+    import pysam
+
+    bam = pysam.AlignmentFile(bam_path, "rb")
+    bam_chroms = set(bam.references)
+    chrom_sizes = dict(zip(bam.references, bam.lengths))
+
+    map_bw = None
+    map_chroms = set()
+    if mappability_bw_path:
+        import pyBigWig
+        map_bw = pyBigWig.open(mappability_bw_path)
+        map_chroms = set(map_bw.chroms().keys())
+
+    # Filter to requested families
+    if family_filter:
+        rm_df = rm_df[rm_df["repeat_name"].isin(family_filter)]
+
+    families = rm_df["repeat_name"].unique()
+
+    # Infer consensus length per family
+    cons_lengths = {}
+    for fam in families:
+        sub = rm_df[rm_df["repeat_name"] == fam]
+        cons_lengths[fam] = consensus_length or int(sub["rep_end"].max())
+
+    total_bins = flank_bins + n_bins + flank_bins
+
+    keys = ["sense", "antisense", "sense_5p", "antisense_5p"]
+    if map_bw:
+        keys.append("mappability")
+    family_data = {fam: {k: [] for k in keys} for fam in families}
+    family_bin_centers = {}
+
+    total = len(rm_df)
+    for i, (_, row) in enumerate(rm_df.iterrows()):
+        if (i + 1) % 10000 == 0:
+            print(f"  Extracting (consensus coords): {i+1}/{total} loci...")
+
+        te_len = row["stop"] - row["start"]
+        if te_len < min_te_length:
+            continue
+
+        bam_chrom = _resolve_chrom(row["chrom"], bam_chroms)
+        if bam_chrom is None:
+            continue
+
+        chrom_len = chrom_sizes[bam_chrom]
+        fam = row["repeat_name"]
+        cons_len = cons_lengths[fam]
+        rep_start = row["rep_start"]  # where this copy starts in consensus
+        rep_end = row["rep_end"]      # where this copy ends in consensus
+
+        # Genomic region with flanks
+        ext_start = max(0, row["start"] - flank_bp)
+        ext_stop = min(chrom_len, row["stop"] + flank_bp)
+        region_len = ext_stop - ext_start
+
+        if region_len <= 0:
+            continue
+
+        # --- Coverage ---
+        try:
+            fwd_counts = bam.count_coverage(
+                bam_chrom, ext_start, ext_stop,
+                quality_threshold=0,
+                read_callback=lambda r: (not r.is_reverse and not r.is_secondary
+                                         and not r.is_supplementary),
+            )
+            fwd_vals = np.array(fwd_counts).sum(axis=0).astype(np.float32)
+
+            rev_counts = bam.count_coverage(
+                bam_chrom, ext_start, ext_stop,
+                quality_threshold=0,
+                read_callback=lambda r: (r.is_reverse and not r.is_secondary
+                                         and not r.is_supplementary),
+            )
+            rev_vals = np.array(rev_counts).sum(axis=0).astype(np.float32)
+        except Exception:
+            continue
+
+        # --- 5' ends ---
+        fwd_5p = np.zeros(region_len, dtype=np.float32)
+        rev_5p = np.zeros(region_len, dtype=np.float32)
+
+        for read in bam.fetch(bam_chrom, ext_start, ext_stop):
+            if read.is_unmapped or read.is_secondary or read.is_supplementary:
+                continue
+            if read.is_reverse:
+                pos = read.reference_end
+                if pos is None:
+                    continue
+            else:
+                pos = read.reference_start
+            idx = pos - ext_start
+            if 0 <= idx < region_len:
+                if read.is_reverse:
+                    rev_5p[idx] += 1
+                else:
+                    fwd_5p[idx] += 1
+
+        # --- Mappability ---
+        map_vals = None
+        if map_bw:
+            map_chrom = _resolve_chrom(row["chrom"], map_chroms)
+            if map_chrom:
+                try:
+                    map_vals = np.array(map_bw.values(map_chrom, ext_start, ext_stop), dtype=np.float32)
+                    map_vals = np.nan_to_num(map_vals, 0.0)
+                except Exception:
+                    map_vals = np.ones(region_len, dtype=np.float32)
+            else:
+                map_vals = np.ones(region_len, dtype=np.float32)
+
+        # --- Orient to TE strand ---
+        if row["strand"] == "+":
+            sense_cov, antisense_cov = fwd_vals, rev_vals
+            sense_5p, antisense_5p = fwd_5p, rev_5p
+        else:
+            sense_cov = rev_vals[::-1]
+            antisense_cov = fwd_vals[::-1]
+            sense_5p = rev_5p[::-1]
+            antisense_5p = fwd_5p[::-1]
+            if map_vals is not None:
+                map_vals = map_vals[::-1]
+
+        # --- Map to consensus coordinates ---
+        # Each base in the genomic region maps to a consensus position:
+        # - 5' flank: positions from -flank_bp to 0 (relative to rep_start)
+        # - TE body: positions from rep_start to rep_end in consensus
+        # - 3' flank: positions from rep_end to rep_end + flank_bp
+        #
+        # Build a per-base consensus coordinate array, then bin.
+
+        n_genomic = len(sense_cov)
+        # How many genomic bp are in the left flank, TE body, right flank
+        left_flank_bp = row["start"] - ext_start
+        right_flank_bp = ext_stop - row["stop"]
+        te_body_bp = row["stop"] - row["start"]
+
+        # Consensus positions for each section
+        left_flank_cons = np.linspace(-left_flank_bp, 0, left_flank_bp, endpoint=False) + rep_start
+        te_body_cons = np.linspace(rep_start, rep_end, te_body_bp, endpoint=False)
+        right_flank_cons = np.linspace(0, right_flank_bp, right_flank_bp, endpoint=False) + rep_end
+
+        cons_positions = np.concatenate([left_flank_cons, te_body_cons, right_flank_cons])
+
+        # Trim to actual array length (in case of rounding)
+        cons_positions = cons_positions[:n_genomic]
+        if len(cons_positions) < n_genomic:
+            cons_positions = np.pad(cons_positions, (0, n_genomic - len(cons_positions)),
+                                     mode='edge')
+
+        # Bin into consensus coordinate bins
+        # x-axis: (rep_start - flank_bp) to (rep_end + flank_bp) mapped to
+        # (-flank_bp, 0) for 5' flank, (0, cons_len) for body, (cons_len, cons_len+flank_bp) for 3' flank
+        # But we want ALL families to share the same x-axis (0 to cons_len for body)
+        # Use: bin_start = -flank_bp relative to consensus pos 1
+        bin_start = 1 - flank_bp
+        bin_end = cons_len + flank_bp
+        bin_edges = np.linspace(bin_start, bin_end, total_bins + 1)
+        bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+
+        if fam not in family_bin_centers:
+            family_bin_centers[fam] = bin_centers
+
+        # Histogram each signal into consensus bins
+        def _bin_signal(signal, positions, edges):
+            result = np.zeros(len(edges) - 1, dtype=np.float32)
+            counts = np.zeros(len(edges) - 1, dtype=np.float32)
+            indices = np.digitize(positions, edges) - 1
+            indices = np.clip(indices, 0, len(result) - 1)
+            for j in range(len(signal)):
+                result[indices[j]] += signal[j]
+                counts[indices[j]] += 1
+            # Average (not sum) so bins with more bases don't dominate
+            mask = counts > 0
+            result[mask] /= counts[mask]
+            return result
+
+        family_data[fam]["sense"].append(_bin_signal(sense_cov, cons_positions, bin_edges))
+        family_data[fam]["antisense"].append(_bin_signal(antisense_cov, cons_positions, bin_edges))
+        family_data[fam]["sense_5p"].append(_bin_signal(sense_5p, cons_positions, bin_edges))
+        family_data[fam]["antisense_5p"].append(_bin_signal(antisense_5p, cons_positions, bin_edges))
+        if map_vals is not None:
+            family_data[fam]["mappability"].append(_bin_signal(map_vals, cons_positions, bin_edges))
+
+    bam.close()
+    if map_bw:
+        map_bw.close()
+
+    result = {}
+    for fam in families:
+        s_list = family_data[fam]["sense"]
+        if len(s_list) == 0:
+            continue
+        d = {
+            "sense": np.stack(s_list),
+            "antisense": np.stack(family_data[fam]["antisense"]),
+            "sense_5p": np.stack(family_data[fam]["sense_5p"]),
+            "antisense_5p": np.stack(family_data[fam]["antisense_5p"]),
+            "bin_centers": family_bin_centers[fam],
+        }
+        if "mappability" in family_data[fam] and len(family_data[fam]["mappability"]) > 0:
+            d["mappability"] = np.stack(family_data[fam]["mappability"])
+        result[fam] = d
+
+    return result
+
+
 def extract_coverage(
     bw_forward_path: str,
     bw_reverse_path: str,
@@ -571,7 +861,30 @@ def plot_footprints(
     for fam, enrichment in scored:
         fp = footprints[fam]
         bc = fp.bin_centers
-        te_mask = (bc >= 0) & (bc <= 1)
+
+        # Detect coordinate system: consensus bp (large values) vs relative [0,1]
+        is_consensus = bc.max() > 10
+        if is_consensus:
+            # Consensus coords: TE body is between first positive value and
+            # the point where flank starts on the right
+            # Approximate: body starts at 1, ends at max - flank region
+            te_start_x = 1
+            te_end_x = bc[bc > 0].max() - (bc.max() - bc[bc > 0].max()) if bc[bc > 0].max() > 0 else bc.max()
+            # Simpler: body bins have positive values, flanks are negative or > cons_len
+            # Use the gap: flank bins are at extremes
+            positive_bins = bc[bc > 0]
+            if len(positive_bins) > 2:
+                # Body is roughly the middle portion
+                te_end_x = positive_bins[-1] - (bc.max() - positive_bins[-1])
+                if te_end_x <= te_start_x:
+                    te_end_x = positive_bins[int(len(positive_bins) * 0.67)]
+            te_mask = (bc >= te_start_x) & (bc <= te_end_x)
+            x_label = "Consensus position (bp)"
+        else:
+            te_start_x = 0
+            te_end_x = 1
+            te_mask = (bc >= 0) & (bc <= 1)
+            x_label = "Relative position (0 = TE 5', 1 = TE 3')"
 
         has_5p = fp.sense_5p_mean is not None
         n_panels = 5 if has_5p else 3
@@ -579,9 +892,9 @@ def plot_footprints(
 
         # ---- Panel 1: Sense coverage ----
         ax = axes[0]
-        ax.axvspan(0, 1, alpha=0.06, color="#333")
-        ax.axvline(0, color="#333", linewidth=0.8, alpha=0.4)
-        ax.axvline(1, color="#333", linewidth=0.8, alpha=0.4)
+        ax.axvspan(te_start_x, te_end_x, alpha=0.06, color="#333")
+        ax.axvline(te_start_x, color="#333", linewidth=0.8, alpha=0.4)
+        ax.axvline(te_end_x, color="#333", linewidth=0.8, alpha=0.4)
 
         ax.fill_between(bc, fp.sense_mean, alpha=0.4, color="#2166ac", label="Observed sense")
         ax.plot(bc, fp.sense_mean, color="#2166ac", linewidth=1.0)
@@ -598,16 +911,16 @@ def plot_footprints(
         ax.set_ylabel("Mean coverage (CPM)", fontsize=10)
         ax.set_title("Sense strand", fontsize=11)
         ax.legend(fontsize=8, loc="upper right")
-        ax.text(0.0, 1.03, "5'", transform=ax.get_xaxis_transform(),
+        ax.text(te_start_x, 1.03, "5'", transform=ax.get_xaxis_transform(),
                 fontsize=11, fontweight="bold", ha="center")
-        ax.text(1.0, 1.03, "3'", transform=ax.get_xaxis_transform(),
+        ax.text(te_end_x, 1.03, "3'", transform=ax.get_xaxis_transform(),
                 fontsize=11, fontweight="bold", ha="center")
 
         # ---- Panel 2: Antisense ----
         ax = axes[1]
-        ax.axvspan(0, 1, alpha=0.06, color="#333")
-        ax.axvline(0, color="#333", linewidth=0.8, alpha=0.4)
-        ax.axvline(1, color="#333", linewidth=0.8, alpha=0.4)
+        ax.axvspan(te_start_x, te_end_x, alpha=0.06, color="#333")
+        ax.axvline(te_start_x, color="#333", linewidth=0.8, alpha=0.4)
+        ax.axvline(te_end_x, color="#333", linewidth=0.8, alpha=0.4)
 
         ax.fill_between(bc, fp.antisense_mean, alpha=0.4, color="#b2182b", label="Observed antisense")
         ax.plot(bc, fp.antisense_mean, color="#b2182b", linewidth=1.0)
@@ -626,9 +939,9 @@ def plot_footprints(
 
         # ---- Panel 3: Sense - Antisense (autonomous signal) ----
         ax = axes[2]
-        ax.axvspan(0, 1, alpha=0.06, color="#333")
-        ax.axvline(0, color="#333", linewidth=0.8, alpha=0.4)
-        ax.axvline(1, color="#333", linewidth=0.8, alpha=0.4)
+        ax.axvspan(te_start_x, te_end_x, alpha=0.06, color="#333")
+        ax.axvline(te_start_x, color="#333", linewidth=0.8, alpha=0.4)
+        ax.axvline(te_end_x, color="#333", linewidth=0.8, alpha=0.4)
 
         diff = fp.sense_mean - fp.antisense_mean
         bg_diff = fp.bg_sense - fp.bg_antisense
@@ -685,7 +998,7 @@ def plot_footprints(
 
             ax.axhline(0, color="black", linewidth=0.5)
             ax.set_ylabel("Mean 5' ends per locus", fontsize=10)
-            ax.set_xlabel("Relative position (0 = TE 5', 1 = TE 3')", fontsize=10)
+            ax.set_xlabel(x_label, fontsize=10)
             ax.set_title("Antisense read 5' ends", fontsize=11)
             ax.legend(fontsize=8, loc="upper right")
 
