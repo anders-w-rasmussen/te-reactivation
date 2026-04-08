@@ -47,6 +47,7 @@ def main():
     fp_parser.add_argument("--out-dir", "-o", required=True, help="Output directory for plots")
     fp_parser.add_argument("--n-bins", type=int, default=100, help="Bins across TE body (default: 100)")
     fp_parser.add_argument("--flank-frac", type=float, default=0.5, help="Flank size as fraction of TE length (default: 0.5)")
+    fp_parser.add_argument("--mappability-bw", help="Mappability bigWig for background correction (e.g. k100.Umap.bw)")
     fp_parser.add_argument("--top-n", type=int, default=None, help="Only plot top N families by enrichment")
 
     args = parser.parse_args()
@@ -63,10 +64,14 @@ def main():
         print(f"  {len(bed_df)} loci across {n_fam} families")
 
         if args.bam:
+            map_bw = getattr(args, 'mappability_bw', None)
+            if map_bw:
+                print(f"Using mappability correction: {map_bw}")
             print(f"Extracting coverage from BAM: {args.bam}")
             coverages = extract_coverage_bam(
                 args.bam, bed_df,
                 n_bins=args.n_bins, flank_frac=args.flank_frac,
+                mappability_bw_path=map_bw,
             )
         else:
             print(f"Extracting coverage from bigWigs...")

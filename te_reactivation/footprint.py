@@ -39,6 +39,8 @@ class FamilyFootprint:
     antisense_5p_mean: np.ndarray | None = None
     bg_sense_5p: np.ndarray | None = None
     bg_antisense_5p: np.ndarray | None = None
+    # Mappability
+    mappability_mean: np.ndarray | None = None
 
 
 def load_bed(bed_path: str) -> pd.DataFrame:
@@ -155,25 +157,30 @@ def extract_coverage_bam(
     n_bins: int = 100,
     flank_frac: float = 0.5,
     min_te_length: int = 50,
+    mappability_bw_path: str = None,
 ) -> dict[str, dict]:
     """
-    Extract per-base strand-specific coverage AND 5' read-end positions
-    from a BAM file in a single pass per locus.
-
-    Coverage: per-base pileup from count_coverage (fast, index-based).
-    5' ends: iterate reads once to record read start positions.
+    Extract per-base strand-specific coverage, 5' read-end positions,
+    and optionally mappability from a BAM file.
 
     Returns dict: family -> {
         "sense": (n_loci, total_bins),
         "antisense": (n_loci, total_bins),
-        "sense_5p": (n_loci, total_bins),      # 5' end density
+        "sense_5p": (n_loci, total_bins),
         "antisense_5p": (n_loci, total_bins),
+        "mappability": (n_loci, total_bins) or None,
         "bin_centers": array,
     }
     """
     import pysam
 
     bam = pysam.AlignmentFile(bam_path, "rb")
+
+    # Open mappability bigWig if provided
+    map_bw = None
+    if mappability_bw_path:
+        import pyBigWig
+        map_bw = pyBigWig.open(mappability_bw_path)
 
     flank_bins = int(n_bins * flank_frac)
     total_bins = flank_bins + n_bins + flank_bins
@@ -182,8 +189,10 @@ def extract_coverage_bam(
     bin_centers = np.linspace(range_start, range_end, total_bins)
 
     families = bed_df["te_family"].unique()
-    family_data = {fam: {"sense": [], "antisense": [],
-                         "sense_5p": [], "antisense_5p": []}
+    keys = ["sense", "antisense", "sense_5p", "antisense_5p"]
+    if map_bw:
+        keys.append("mappability")
+    family_data = {fam: {k: [] for k in keys}
                    for fam in families}
 
     chrom_sizes = dict(zip(bam.references, bam.lengths))
@@ -257,6 +266,15 @@ def extract_coverage_bam(
                 else:
                     fwd_5p[idx] += 1
 
+        # --- Mappability (if available) ---
+        map_vals = None
+        if map_bw:
+            try:
+                map_vals = np.array(map_bw.values(chrom, ext_start, ext_stop), dtype=np.float32)
+                map_vals = np.nan_to_num(map_vals, 0.0)
+            except Exception:
+                map_vals = np.ones(region_len, dtype=np.float32)
+
         # --- Orient to TE strand ---
         if te_strand == "+":
             sense_cov = fwd_vals
@@ -268,27 +286,37 @@ def extract_coverage_bam(
             antisense_cov = fwd_vals[::-1]
             sense_5p = rev_5p[::-1]
             antisense_5p = fwd_5p[::-1]
+            if map_vals is not None:
+                map_vals = map_vals[::-1]
 
         # Resize all to bins
-        family_data[row["te_family"]]["sense"].append(_resize_to_bins(sense_cov, total_bins))
-        family_data[row["te_family"]]["antisense"].append(_resize_to_bins(antisense_cov, total_bins))
-        family_data[row["te_family"]]["sense_5p"].append(_resize_to_bins(sense_5p, total_bins))
-        family_data[row["te_family"]]["antisense_5p"].append(_resize_to_bins(antisense_5p, total_bins))
+        fam = row["te_family"]
+        family_data[fam]["sense"].append(_resize_to_bins(sense_cov, total_bins))
+        family_data[fam]["antisense"].append(_resize_to_bins(antisense_cov, total_bins))
+        family_data[fam]["sense_5p"].append(_resize_to_bins(sense_5p, total_bins))
+        family_data[fam]["antisense_5p"].append(_resize_to_bins(antisense_5p, total_bins))
+        if map_vals is not None:
+            family_data[fam]["mappability"].append(_resize_to_bins(map_vals, total_bins))
 
     bam.close()
+    if map_bw:
+        map_bw.close()
 
     result = {}
     for fam in families:
         s_list = family_data[fam]["sense"]
         if len(s_list) == 0:
             continue
-        result[fam] = {
+        d = {
             "sense": np.stack(s_list),
             "antisense": np.stack(family_data[fam]["antisense"]),
             "sense_5p": np.stack(family_data[fam]["sense_5p"]),
             "antisense_5p": np.stack(family_data[fam]["antisense_5p"]),
             "bin_centers": bin_centers,
         }
+        if "mappability" in family_data[fam] and len(family_data[fam]["mappability"]) > 0:
+            d["mappability"] = np.stack(family_data[fam]["mappability"])
+        result[fam] = d
 
     return result
 
@@ -320,31 +348,40 @@ def compute_footprints(
     """
     Compute aggregate footprints with background estimation for each family.
 
-    Background estimation:
-    1. Local regression: smooth the signal in flank regions, interpolate
-       across the TE body to get expected level assuming read-through.
-    2. Antisense as null: the antisense signal serves as a second
-       background estimate — autonomous transcription is sense-biased.
+    Background estimation (two modes):
+    A. With mappability: learn coverage = f(mappability) from flanks,
+       predict expected coverage inside TE body given its mappability.
+    B. Without mappability: smooth flank signal, interpolate across TE body.
+
+    In both cases, antisense signal serves as a second background.
     """
     footprints = {}
 
     for fam, cov in family_coverages.items():
-        sense_mat = cov["sense"]       # (n_loci, n_bins)
+        sense_mat = cov["sense"]
         antisense_mat = cov["antisense"]
         bin_centers = cov["bin_centers"]
         n_loci = sense_mat.shape[0]
+        has_map = "mappability" in cov
 
-        # Aggregate coverage
+        # Aggregate
         sense_mean = sense_mat.mean(axis=0)
         sense_median = np.median(sense_mat, axis=0)
         antisense_mean = antisense_mat.mean(axis=0)
         antisense_median = np.median(antisense_mat, axis=0)
+        mappability_mean = cov["mappability"].mean(axis=0) if has_map else None
 
-        # Background via local regression through flanks
-        bg_sense = _estimate_background(sense_mean, bin_centers, flank_frac, bg_smooth_window)
-        bg_antisense = _estimate_background(antisense_mean, bin_centers, flank_frac, bg_smooth_window)
+        # Background estimation
+        if has_map:
+            bg_sense = _estimate_background_mappability(
+                sense_mean, mappability_mean, bin_centers, flank_frac)
+            bg_antisense = _estimate_background_mappability(
+                antisense_mean, mappability_mean, bin_centers, flank_frac)
+        else:
+            bg_sense = _estimate_background(sense_mean, bin_centers, flank_frac, bg_smooth_window)
+            bg_antisense = _estimate_background(antisense_mean, bin_centers, flank_frac, bg_smooth_window)
 
-        # 5' end data (if available)
+        # 5' end data
         sense_5p_mean = None
         antisense_5p_mean = None
         bg_sense_5p = None
@@ -352,8 +389,14 @@ def compute_footprints(
         if "sense_5p" in cov:
             sense_5p_mean = cov["sense_5p"].mean(axis=0)
             antisense_5p_mean = cov["antisense_5p"].mean(axis=0)
-            bg_sense_5p = _estimate_background(sense_5p_mean, bin_centers, flank_frac, bg_smooth_window)
-            bg_antisense_5p = _estimate_background(antisense_5p_mean, bin_centers, flank_frac, bg_smooth_window)
+            if has_map:
+                bg_sense_5p = _estimate_background_mappability(
+                    sense_5p_mean, mappability_mean, bin_centers, flank_frac)
+                bg_antisense_5p = _estimate_background_mappability(
+                    antisense_5p_mean, mappability_mean, bin_centers, flank_frac)
+            else:
+                bg_sense_5p = _estimate_background(sense_5p_mean, bin_centers, flank_frac, bg_smooth_window)
+                bg_antisense_5p = _estimate_background(antisense_5p_mean, bin_centers, flank_frac, bg_smooth_window)
 
         footprints[fam] = FamilyFootprint(
             family_name=fam,
@@ -369,6 +412,7 @@ def compute_footprints(
             antisense_5p_mean=antisense_5p_mean,
             bg_sense_5p=bg_sense_5p,
             bg_antisense_5p=bg_antisense_5p,
+            mappability_mean=mappability_mean,
         )
 
     return footprints
@@ -404,6 +448,64 @@ def _estimate_background(
     bg = np.interp(bin_centers, flank_x, flank_y)
 
     return bg.astype(np.float32)
+
+
+def _estimate_background_mappability(
+    signal: np.ndarray,
+    mappability: np.ndarray,
+    bin_centers: np.ndarray,
+    flank_frac: float,
+    n_map_bins: int = 20,
+) -> np.ndarray:
+    """
+    Estimate background using mappability regression learned from flanks.
+
+    1. In flank regions, bin positions by mappability score
+    2. For each mappability bin, compute mean coverage → empirical curve
+    3. For TE body positions, predict expected coverage from their mappability
+       using the learned curve
+
+    This accounts for the fact that repetitive TE bodies have different
+    mappability than unique flanking sequences.
+    """
+    flank_mask = (bin_centers < 0) | (bin_centers > 1)
+
+    # Get flank data points
+    flank_signal = signal[flank_mask]
+    flank_map = mappability[flank_mask]
+
+    if len(flank_signal) == 0 or flank_map.max() - flank_map.min() < 1e-6:
+        # Fallback: constant background from flank mean
+        return np.full_like(signal, flank_signal.mean() if len(flank_signal) > 0 else 0)
+
+    # Bin flanks by mappability and compute mean coverage per bin
+    map_bin_edges = np.linspace(flank_map.min() - 1e-6, flank_map.max() + 1e-6, n_map_bins + 1)
+    map_bin_centers = (map_bin_edges[:-1] + map_bin_edges[1:]) / 2
+    bin_means = np.zeros(n_map_bins)
+    bin_counts = np.zeros(n_map_bins)
+
+    bin_indices = np.digitize(flank_map, map_bin_edges) - 1
+    bin_indices = np.clip(bin_indices, 0, n_map_bins - 1)
+
+    for b in range(n_map_bins):
+        mask = bin_indices == b
+        if mask.any():
+            bin_means[b] = flank_signal[mask].mean()
+            bin_counts[b] = mask.sum()
+
+    # Remove empty bins
+    valid = bin_counts > 0
+    if valid.sum() < 2:
+        return np.full_like(signal, flank_signal.mean())
+
+    valid_centers = map_bin_centers[valid]
+    valid_means = bin_means[valid]
+
+    # Predict background for ALL positions (flanks + TE body) using their mappability
+    # Interpolate/extrapolate from the learned curve
+    bg = np.interp(mappability, valid_centers, valid_means).astype(np.float32)
+
+    return bg
 
 
 def plot_footprints(
