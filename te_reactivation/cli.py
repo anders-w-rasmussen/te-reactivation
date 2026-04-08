@@ -37,9 +37,40 @@ def main():
     synth_parser.add_argument("--seed", type=int, default=42)
     synth_parser.add_argument("--plots", help="Directory to save plots (optional)")
 
+    # ---- footprint: bigWig-based footprinting ----
+    fp_parser = subparsers.add_parser("footprint", help="Generate TE footprint plots from bigWig files")
+    fp_parser.add_argument("--bed", required=True, help="BED file: chrom start stop TE_family strand")
+    fp_parser.add_argument("--fwd-bw", required=True, help="Forward-strand bigWig (CPM normalized)")
+    fp_parser.add_argument("--rev-bw", required=True, help="Reverse-strand bigWig (CPM normalized)")
+    fp_parser.add_argument("--out-dir", "-o", required=True, help="Output directory for plots")
+    fp_parser.add_argument("--n-bins", type=int, default=100, help="Bins across TE body (default: 100)")
+    fp_parser.add_argument("--flank-frac", type=float, default=0.5, help="Flank size as fraction of TE length (default: 0.5)")
+    fp_parser.add_argument("--top-n", type=int, default=None, help="Only plot top N families by enrichment")
+
     args = parser.parse_args()
 
-    if args.command == "run":
+    if args.command == "footprint":
+        from .footprint import load_bed as fp_load_bed, extract_coverage, compute_footprints, plot_footprints
+
+        print(f"Loading BED: {args.bed}")
+        bed_df = fp_load_bed(args.bed)
+        n_fam = bed_df["te_family"].nunique()
+        print(f"  {len(bed_df)} loci across {n_fam} families")
+
+        print(f"Extracting coverage from bigWigs...")
+        coverages = extract_coverage(
+            args.fwd_bw, args.rev_bw, bed_df,
+            n_bins=args.n_bins, flank_frac=args.flank_frac,
+        )
+        print(f"  Extracted {sum(v['sense'].shape[0] for v in coverages.values())} loci across {len(coverages)} families")
+
+        print("Computing footprints...")
+        footprints = compute_footprints(coverages, flank_frac=args.flank_frac)
+
+        print(f"Plotting to {args.out_dir}/...")
+        plot_footprints(footprints, save_dir=args.out_dir, top_n=args.top_n)
+
+    elif args.command == "run":
         print(f"Loading BED: {args.bed}")
         bed_df = load_bed(args.bed)
         print(f"  {len(bed_df)} loci across {bed_df['te_family'].nunique()} families")
