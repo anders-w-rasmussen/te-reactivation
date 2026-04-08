@@ -34,9 +34,11 @@ class FamilyFootprint:
     antisense_median: np.ndarray
     bg_sense: np.ndarray           # estimated background (local regression)
     bg_antisense: np.ndarray
-    # Per-locus matrix for variability (optional, can be large)
-    sense_matrix: np.ndarray | None = None   # (n_loci, n_bins)
-    antisense_matrix: np.ndarray | None = None
+    # 5' read-end density
+    sense_5p_mean: np.ndarray | None = None
+    antisense_5p_mean: np.ndarray | None = None
+    bg_sense_5p: np.ndarray | None = None
+    bg_antisense_5p: np.ndarray | None = None
 
 
 def load_bed(bed_path: str) -> pd.DataFrame:
@@ -155,11 +157,19 @@ def extract_coverage_bam(
     min_te_length: int = 50,
 ) -> dict[str, dict]:
     """
-    Extract per-base strand-specific coverage from a BAM file using
-    pysam.count_coverage(). Fast — uses the BAM index, doesn't iterate reads.
+    Extract per-base strand-specific coverage AND 5' read-end positions
+    from a BAM file in a single pass per locus.
 
-    Returns same format as extract_coverage():
-    dict: family -> {"sense": (n_loci, total_bins), "antisense": ..., "bin_centers": ...}
+    Coverage: per-base pileup from count_coverage (fast, index-based).
+    5' ends: iterate reads once to record read start positions.
+
+    Returns dict: family -> {
+        "sense": (n_loci, total_bins),
+        "antisense": (n_loci, total_bins),
+        "sense_5p": (n_loci, total_bins),      # 5' end density
+        "antisense_5p": (n_loci, total_bins),
+        "bin_centers": array,
+    }
     """
     import pysam
 
@@ -172,15 +182,16 @@ def extract_coverage_bam(
     bin_centers = np.linspace(range_start, range_end, total_bins)
 
     families = bed_df["te_family"].unique()
-    family_data = {fam: {"sense": [], "antisense": []} for fam in families}
+    family_data = {fam: {"sense": [], "antisense": [],
+                         "sense_5p": [], "antisense_5p": []}
+                   for fam in families}
 
-    # Get chrom lengths from BAM header
     chrom_sizes = dict(zip(bam.references, bam.lengths))
 
     total = len(bed_df)
     for i, (_, row) in enumerate(bed_df.iterrows()):
         if (i + 1) % 10000 == 0:
-            print(f"  Coverage extraction: {i+1}/{total} loci...")
+            print(f"  Extracting: {i+1}/{total} loci...")
 
         te_len = row["stop"] - row["start"]
         if te_len < min_te_length:
@@ -192,15 +203,19 @@ def extract_coverage_bam(
 
         chrom_len = chrom_sizes[chrom]
         flank_bp = int(te_len * flank_frac)
+        te_start = row["start"]
+        te_stop = row["stop"]
+        te_strand = row["strand"]
 
-        ext_start = max(0, row["start"] - flank_bp)
-        ext_stop = min(chrom_len, row["stop"] + flank_bp)
+        ext_start = max(0, te_start - flank_bp)
+        ext_stop = min(chrom_len, te_stop + flank_bp)
+        region_len = ext_stop - ext_start
 
+        if region_len <= 0:
+            continue
+
+        # --- Coverage via count_coverage (fast, index-based) ---
         try:
-            # count_coverage returns tuple of 4 arrays (A, C, G, T) per base
-            # We need to call it twice with strand filters
-
-            # Forward strand reads
             fwd_counts = bam.count_coverage(
                 chrom, ext_start, ext_stop,
                 quality_threshold=0,
@@ -209,7 +224,6 @@ def extract_coverage_bam(
             )
             fwd_vals = np.array(fwd_counts).sum(axis=0).astype(np.float32)
 
-            # Reverse strand reads
             rev_counts = bam.count_coverage(
                 chrom, ext_start, ext_stop,
                 quality_threshold=0,
@@ -220,31 +234,59 @@ def extract_coverage_bam(
         except Exception:
             continue
 
-        # Orient to TE strand
-        if row["strand"] == "+":
-            sense_vals = fwd_vals
-            antisense_vals = rev_vals
+        # --- 5' end positions via fetch (need read-level info) ---
+        fwd_5p = np.zeros(region_len, dtype=np.float32)
+        rev_5p = np.zeros(region_len, dtype=np.float32)
+
+        for read in bam.fetch(chrom, ext_start, ext_stop):
+            if read.is_unmapped or read.is_secondary or read.is_supplementary:
+                continue
+
+            # 5' end of the read
+            if read.is_reverse:
+                pos = read.reference_end  # 5' end for reverse reads
+                if pos is None:
+                    continue
+            else:
+                pos = read.reference_start  # 5' end for forward reads
+
+            idx = pos - ext_start
+            if 0 <= idx < region_len:
+                if read.is_reverse:
+                    rev_5p[idx] += 1
+                else:
+                    fwd_5p[idx] += 1
+
+        # --- Orient to TE strand ---
+        if te_strand == "+":
+            sense_cov = fwd_vals
+            antisense_cov = rev_vals
+            sense_5p = fwd_5p
+            antisense_5p = rev_5p
         else:
-            sense_vals = rev_vals[::-1]
-            antisense_vals = fwd_vals[::-1]
+            sense_cov = rev_vals[::-1]
+            antisense_cov = fwd_vals[::-1]
+            sense_5p = rev_5p[::-1]
+            antisense_5p = fwd_5p[::-1]
 
-        sense_binned = _resize_to_bins(sense_vals, total_bins)
-        antisense_binned = _resize_to_bins(antisense_vals, total_bins)
-
-        family_data[row["te_family"]]["sense"].append(sense_binned)
-        family_data[row["te_family"]]["antisense"].append(antisense_binned)
+        # Resize all to bins
+        family_data[row["te_family"]]["sense"].append(_resize_to_bins(sense_cov, total_bins))
+        family_data[row["te_family"]]["antisense"].append(_resize_to_bins(antisense_cov, total_bins))
+        family_data[row["te_family"]]["sense_5p"].append(_resize_to_bins(sense_5p, total_bins))
+        family_data[row["te_family"]]["antisense_5p"].append(_resize_to_bins(antisense_5p, total_bins))
 
     bam.close()
 
     result = {}
     for fam in families:
         s_list = family_data[fam]["sense"]
-        a_list = family_data[fam]["antisense"]
         if len(s_list) == 0:
             continue
         result[fam] = {
             "sense": np.stack(s_list),
-            "antisense": np.stack(a_list),
+            "antisense": np.stack(family_data[fam]["antisense"]),
+            "sense_5p": np.stack(family_data[fam]["sense_5p"]),
+            "antisense_5p": np.stack(family_data[fam]["antisense_5p"]),
             "bin_centers": bin_centers,
         }
 
@@ -292,7 +334,7 @@ def compute_footprints(
         bin_centers = cov["bin_centers"]
         n_loci = sense_mat.shape[0]
 
-        # Aggregate
+        # Aggregate coverage
         sense_mean = sense_mat.mean(axis=0)
         sense_median = np.median(sense_mat, axis=0)
         antisense_mean = antisense_mat.mean(axis=0)
@@ -301,6 +343,17 @@ def compute_footprints(
         # Background via local regression through flanks
         bg_sense = _estimate_background(sense_mean, bin_centers, flank_frac, bg_smooth_window)
         bg_antisense = _estimate_background(antisense_mean, bin_centers, flank_frac, bg_smooth_window)
+
+        # 5' end data (if available)
+        sense_5p_mean = None
+        antisense_5p_mean = None
+        bg_sense_5p = None
+        bg_antisense_5p = None
+        if "sense_5p" in cov:
+            sense_5p_mean = cov["sense_5p"].mean(axis=0)
+            antisense_5p_mean = cov["antisense_5p"].mean(axis=0)
+            bg_sense_5p = _estimate_background(sense_5p_mean, bin_centers, flank_frac, bg_smooth_window)
+            bg_antisense_5p = _estimate_background(antisense_5p_mean, bin_centers, flank_frac, bg_smooth_window)
 
         footprints[fam] = FamilyFootprint(
             family_name=fam,
@@ -312,6 +365,10 @@ def compute_footprints(
             antisense_median=antisense_median,
             bg_sense=bg_sense,
             bg_antisense=bg_antisense,
+            sense_5p_mean=sense_5p_mean,
+            antisense_5p_mean=antisense_5p_mean,
+            bg_sense_5p=bg_sense_5p,
+            bg_antisense_5p=bg_antisense_5p,
         )
 
     return footprints
@@ -385,9 +442,11 @@ def plot_footprints(
         bc = fp.bin_centers
         te_mask = (bc >= 0) & (bc <= 1)
 
-        fig, axes = plt.subplots(3, 1, figsize=(12, 12))
+        has_5p = fp.sense_5p_mean is not None
+        n_panels = 5 if has_5p else 3
+        fig, axes = plt.subplots(n_panels, 1, figsize=(12, 4 * n_panels))
 
-        # ---- Panel 1: Sense ----
+        # ---- Panel 1: Sense coverage ----
         ax = axes[0]
         ax.axvspan(0, 1, alpha=0.06, color="#333")
         ax.axvline(0, color="#333", linewidth=0.8, alpha=0.4)
@@ -450,9 +509,57 @@ def plot_footprints(
 
         ax.axhline(0, color="black", linewidth=0.8, linestyle=":")
         ax.set_ylabel("Sense - Antisense (CPM)", fontsize=10)
-        ax.set_xlabel("Relative position (0 = TE 5', 1 = TE 3')", fontsize=10)
         ax.set_title("Strand asymmetry (positive = sense-biased = autonomous)", fontsize=11)
         ax.legend(fontsize=8, loc="upper right")
+
+        # ---- Panel 4: Sense 5' read ends ----
+        if has_5p:
+            ax = axes[3]
+            ax.axvspan(0, 1, alpha=0.06, color="#333")
+            ax.axvline(0, color="#333", linewidth=0.8, alpha=0.4)
+            ax.axvline(1, color="#333", linewidth=0.8, alpha=0.4)
+
+            ax.fill_between(bc, fp.sense_5p_mean, alpha=0.4, color="#2166ac",
+                            label="Sense 5' ends")
+            ax.plot(bc, fp.sense_5p_mean, color="#2166ac", linewidth=1.0)
+            ax.plot(bc, fp.bg_sense_5p, color="#2166ac", linewidth=2, linestyle="--",
+                    label="Expected bg")
+
+            ax.fill_between(bc[te_mask],
+                            fp.bg_sense_5p[te_mask],
+                            np.maximum(fp.sense_5p_mean[te_mask], fp.bg_sense_5p[te_mask]),
+                            alpha=0.35, color="#ff7f0e", label="Excess")
+
+            ax.axhline(0, color="black", linewidth=0.5)
+            ax.set_ylabel("Mean 5' ends per locus", fontsize=10)
+            ax.set_title("Sense read 5' ends (TSS proxy — strongest with long reads)", fontsize=11)
+            ax.legend(fontsize=8, loc="upper right")
+
+            # ---- Panel 5: Antisense 5' read ends ----
+            ax = axes[4]
+            ax.axvspan(0, 1, alpha=0.06, color="#333")
+            ax.axvline(0, color="#333", linewidth=0.8, alpha=0.4)
+            ax.axvline(1, color="#333", linewidth=0.8, alpha=0.4)
+
+            ax.fill_between(bc, fp.antisense_5p_mean, alpha=0.4, color="#b2182b",
+                            label="Antisense 5' ends")
+            ax.plot(bc, fp.antisense_5p_mean, color="#b2182b", linewidth=1.0)
+            ax.plot(bc, fp.bg_antisense_5p, color="#b2182b", linewidth=2, linestyle="--",
+                    label="Expected bg")
+
+            ax.fill_between(bc[te_mask],
+                            fp.bg_antisense_5p[te_mask],
+                            np.maximum(fp.antisense_5p_mean[te_mask], fp.bg_antisense_5p[te_mask]),
+                            alpha=0.35, color="#ff7f0e", label="Excess")
+
+            ax.axhline(0, color="black", linewidth=0.5)
+            ax.set_ylabel("Mean 5' ends per locus", fontsize=10)
+            ax.set_xlabel("Relative position (0 = TE 5', 1 = TE 3')", fontsize=10)
+            ax.set_title("Antisense read 5' ends", fontsize=11)
+            ax.legend(fontsize=8, loc="upper right")
+
+        if not has_5p:
+            axes[2].set_xlabel("Relative position (0 = TE 5', 1 = TE 3')", fontsize=10)
 
         # Compute summary stats
         te_sense = fp.sense_mean[te_mask].mean()
