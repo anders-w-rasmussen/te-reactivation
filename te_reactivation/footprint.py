@@ -1210,6 +1210,7 @@ def plot_footprint_comparison(
     5. Antisense 5' ends
     """
     import matplotlib.pyplot as plt
+    import os
 
     if save_dir:
         os.makedirs(save_dir, exist_ok=True)
