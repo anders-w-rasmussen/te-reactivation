@@ -328,16 +328,19 @@ def extract_coverage_consensus(
             family_bin_centers[fam] = bin_centers
 
         # Histogram each signal into consensus bins
+        # Returns NaN for bins this copy doesn't cover, so nanmean later
+        # only averages over copies that actually have each position
         def _bin_signal(signal, positions, edges):
-            result = np.zeros(len(edges) - 1, dtype=np.float32)
+            result = np.full(len(edges) - 1, np.nan, dtype=np.float32)
+            sums = np.zeros(len(edges) - 1, dtype=np.float32)
             counts = np.zeros(len(edges) - 1, dtype=np.float32)
             indices = np.digitize(positions, edges) - 1
-            indices = np.clip(indices, 0, len(result) - 1)
+            indices = np.clip(indices, 0, len(sums) - 1)
             for j in range(len(signal)):
-                result[indices[j]] += signal[j]
+                sums[indices[j]] += signal[j]
                 counts[indices[j]] += 1
             mask = counts > 0
-            result[mask] /= counts[mask]
+            result[mask] = sums[mask] / counts[mask]
             return result
 
         family_data[fam]["sense"].append(_bin_signal(sense_cov, cons_positions, bin_edges))
@@ -690,12 +693,21 @@ def compute_footprints(
         n_loci = sense_mat.shape[0]
         has_map = "mappability" in cov
 
-        # Aggregate
-        sense_mean = sense_mat.mean(axis=0)
-        sense_median = np.median(sense_mat, axis=0)
-        antisense_mean = antisense_mat.mean(axis=0)
-        antisense_median = np.median(antisense_mat, axis=0)
-        mappability_mean = cov["mappability"].mean(axis=0) if has_map else None
+        # Aggregate — use nanmean/nanmedian so bins not covered by a copy
+        # (NaN) are excluded from the average rather than counted as zero
+        with np.errstate(all='ignore'):
+            sense_mean = np.nanmean(sense_mat, axis=0)
+            sense_median = np.nanmedian(sense_mat, axis=0)
+            antisense_mean = np.nanmean(antisense_mat, axis=0)
+            antisense_median = np.nanmedian(antisense_mat, axis=0)
+            mappability_mean = np.nanmean(cov["mappability"], axis=0) if has_map else None
+        # Replace any remaining NaN with 0
+        sense_mean = np.nan_to_num(sense_mean, 0.0)
+        sense_median = np.nan_to_num(sense_median, 0.0)
+        antisense_mean = np.nan_to_num(antisense_mean, 0.0)
+        antisense_median = np.nan_to_num(antisense_median, 0.0)
+        if mappability_mean is not None:
+            mappability_mean = np.nan_to_num(mappability_mean, 0.0)
 
         # Background estimation
         if has_map:
@@ -713,8 +725,9 @@ def compute_footprints(
         bg_sense_5p = None
         bg_antisense_5p = None
         if "sense_5p" in cov:
-            sense_5p_mean = cov["sense_5p"].mean(axis=0)
-            antisense_5p_mean = cov["antisense_5p"].mean(axis=0)
+            with np.errstate(all='ignore'):
+                sense_5p_mean = np.nan_to_num(np.nanmean(cov["sense_5p"], axis=0), 0.0)
+                antisense_5p_mean = np.nan_to_num(np.nanmean(cov["antisense_5p"], axis=0), 0.0)
             if has_map:
                 bg_sense_5p = _estimate_background_mappability(
                     sense_5p_mean, mappability_mean, bin_centers, flank_frac)
