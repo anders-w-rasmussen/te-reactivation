@@ -280,38 +280,46 @@ def extract_coverage_consensus(
                 map_vals = map_vals[::-1]
 
         # --- Map to consensus coordinates ---
-        # Each base in the genomic region maps to a consensus position:
-        # - 5' flank: positions from -flank_bp to 0 (relative to rep_start)
-        # - TE body: positions from rep_start to rep_end in consensus
-        # - 3' flank: positions from rep_end to rep_end + flank_bp
-        #
-        # Build a per-base consensus coordinate array, then bin.
+        # TE body: each genomic base maps linearly to consensus rep_start..rep_end
+        # Flanks: map to dedicated flank bins OUTSIDE the consensus range
+        #   5' flank → (-flank_bp, 0) regardless of rep_start
+        #   3' flank → (cons_len, cons_len + flank_bp) regardless of rep_end
+        # This ensures all copies contribute flanks to the same bins.
 
         n_genomic = len(sense_cov)
-        # How many genomic bp are in the left flank, TE body, right flank
-        left_flank_bp = row["start"] - ext_start
-        right_flank_bp = ext_stop - row["stop"]
-        te_body_bp = row["stop"] - row["start"]
+        left_flank_len = row["start"] - ext_start
+        right_flank_len = ext_stop - row["stop"]
+        te_body_len = row["stop"] - row["start"]
 
-        # Consensus positions for each section
-        left_flank_cons = np.linspace(-left_flank_bp, 0, left_flank_bp, endpoint=False) + rep_start
-        te_body_cons = np.linspace(rep_start, rep_end, te_body_bp, endpoint=False)
-        right_flank_cons = np.linspace(0, right_flank_bp, right_flank_bp, endpoint=False) + rep_end
+        # Build consensus coordinate for each genomic base
+        # 5' flank: map to (-flank_bp, 0)
+        if left_flank_len > 0:
+            left_flank_cons = np.linspace(-flank_bp, 0, left_flank_len, endpoint=False)
+        else:
+            left_flank_cons = np.array([], dtype=np.float64)
+
+        # TE body: map to (rep_start, rep_end)
+        if te_body_len > 0:
+            te_body_cons = np.linspace(rep_start, rep_end, te_body_len, endpoint=False)
+        else:
+            te_body_cons = np.array([], dtype=np.float64)
+
+        # 3' flank: map to (cons_len, cons_len + flank_bp)
+        if right_flank_len > 0:
+            right_flank_cons = np.linspace(cons_len, cons_len + flank_bp, right_flank_len, endpoint=False)
+        else:
+            right_flank_cons = np.array([], dtype=np.float64)
 
         cons_positions = np.concatenate([left_flank_cons, te_body_cons, right_flank_cons])
 
-        # Trim to actual array length (in case of rounding)
+        # Trim/pad to match signal array length
         cons_positions = cons_positions[:n_genomic]
         if len(cons_positions) < n_genomic:
             cons_positions = np.pad(cons_positions, (0, n_genomic - len(cons_positions)),
                                      mode='edge')
 
-        # Bin into consensus coordinate bins
-        # x-axis: (rep_start - flank_bp) to (rep_end + flank_bp) mapped to
-        # (-flank_bp, 0) for 5' flank, (0, cons_len) for body, (cons_len, cons_len+flank_bp) for 3' flank
-        # But we want ALL families to share the same x-axis (0 to cons_len for body)
-        # Use: bin_start = -flank_bp relative to consensus pos 1
-        bin_start = 1 - flank_bp
+        # Bin edges: (-flank_bp) to (cons_len + flank_bp)
+        bin_start = -flank_bp
         bin_end = cons_len + flank_bp
         bin_edges = np.linspace(bin_start, bin_end, total_bins + 1)
         bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
@@ -328,7 +336,6 @@ def extract_coverage_consensus(
             for j in range(len(signal)):
                 result[indices[j]] += signal[j]
                 counts[indices[j]] += 1
-            # Average (not sum) so bins with more bases don't dominate
             mask = counts > 0
             result[mask] /= counts[mask]
             return result
@@ -865,19 +872,17 @@ def plot_footprints(
         # Detect coordinate system: consensus bp (large values) vs relative [0,1]
         is_consensus = bc.max() > 10
         if is_consensus:
-            # Consensus coords: TE body is between first positive value and
-            # the point where flank starts on the right
-            # Approximate: body starts at 1, ends at max - flank region
+            # Consensus coords: flanks are [-flank, 0] and [cons_len, cons_len+flank]
+            # TE body is [0, cons_len] where cons_len = midpoint of total range
+            te_start_x = 0
+            te_end_x = (bc.max() - bc.min()) / 2 + bc.min()  # ≈ cons_len
+            # More precise: TE body is [1, cons_len], flanks symmetric around it
+            # So cons_len ≈ bc.max() - (-bc.min()) = bc.max() + bc.min() ... no
+            # bin range is (-flank_bp, cons_len + flank_bp), so cons_len = range/2
+            # Actually: bc.min() = -flank_bp, bc.max() = cons_len + flank_bp
+            # So cons_len = bc.max() - (-bc.min()) = bc.max() + bc.min()
             te_start_x = 1
-            te_end_x = bc[bc > 0].max() - (bc.max() - bc[bc > 0].max()) if bc[bc > 0].max() > 0 else bc.max()
-            # Simpler: body bins have positive values, flanks are negative or > cons_len
-            # Use the gap: flank bins are at extremes
-            positive_bins = bc[bc > 0]
-            if len(positive_bins) > 2:
-                # Body is roughly the middle portion
-                te_end_x = positive_bins[-1] - (bc.max() - positive_bins[-1])
-                if te_end_x <= te_start_x:
-                    te_end_x = positive_bins[int(len(positive_bins) * 0.67)]
+            te_end_x = bc.max() + bc.min()
             te_mask = (bc >= te_start_x) & (bc <= te_end_x)
             x_label = "Consensus position (bp)"
         else:
