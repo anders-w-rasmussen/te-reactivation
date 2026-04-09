@@ -1142,6 +1142,58 @@ def extract_and_aggregate_by_condition(
     return condition_footprints
 
 
+def extract_and_aggregate_by_condition_relative(
+    samples: dict[str, list[str]],
+    bed_df: pd.DataFrame,
+    family_filter: list[str] = None,
+    n_bins: int = 100,
+    flank_frac: float = 0.5,
+    mappability_bw_path: str = None,
+) -> dict[str, dict[str, FamilyFootprint]]:
+    """
+    Run extract_coverage_bam (relative [0,1] coords) for each BAM,
+    then aggregate footprints per condition.
+
+    Best for short TEs like Alus and SVAs.
+    Returns dict: condition -> {family -> FamilyFootprint}
+    """
+    if family_filter:
+        bed_df = bed_df[bed_df["te_family"].isin(family_filter)]
+
+    condition_footprints = {}
+
+    for condition, bam_paths in samples.items():
+        print(f"\n  Condition: {condition} ({len(bam_paths)} samples)")
+
+        merged = {}
+
+        for bam_path in bam_paths:
+            print(f"    Processing: {bam_path}")
+            coverages = extract_coverage_bam(
+                bam_path, bed_df,
+                n_bins=n_bins,
+                flank_frac=flank_frac,
+                mappability_bw_path=mappability_bw_path,
+            )
+
+            for fam, cov in coverages.items():
+                if fam not in merged:
+                    merged[fam] = {k: [] for k in cov if k != "bin_centers"}
+                    merged[fam]["bin_centers"] = cov["bin_centers"]
+                for k in cov:
+                    if k != "bin_centers":
+                        merged[fam][k].append(cov[k])
+
+        for fam in merged:
+            for k in merged[fam]:
+                if k != "bin_centers" and isinstance(merged[fam][k], list):
+                    merged[fam][k] = np.concatenate(merged[fam][k], axis=0)
+
+        condition_footprints[condition] = compute_footprints(merged, flank_frac=flank_frac)
+
+    return condition_footprints
+
+
 def plot_footprint_comparison(
     condition_footprints: dict[str, dict[str, FamilyFootprint]],
     save_dir: str = None,

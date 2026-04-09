@@ -67,42 +67,70 @@ def main():
         help="Compare TE footprints between conditions (e.g. control vs IBD)")
     cmp_parser.add_argument("--samples", required=True,
         help="TSV file: bam_path<TAB>condition (e.g. control or alt)")
-    cmp_parser.add_argument("--rm-out", required=True, help="RepeatMasker .out file")
     cmp_parser.add_argument("--out-dir", "-o", required=True, help="Output directory")
     cmp_parser.add_argument("--families", help="Comma-separated family names")
-    cmp_parser.add_argument("--n-bins", type=int, default=200, help="Bins across consensus (default: 200)")
-    cmp_parser.add_argument("--flank-bp", type=int, default=2000, help="Flank size in bp (default: 2000)")
+    cmp_parser.add_argument("--mode", choices=["relative", "consensus"], default="consensus",
+        help="relative: normalize to [0,1] (best for short TEs like Alus/SVAs). "
+             "consensus: use RepeatMasker consensus coords (best for L1s/HERVs). Default: consensus")
+    cmp_parser.add_argument("--rm-out", help="RepeatMasker .out file (required for consensus mode)")
+    cmp_parser.add_argument("--bed", help="BED file (required for relative mode)")
+    cmp_parser.add_argument("--n-bins", type=int, default=200, help="Bins across TE body (default: 200)")
+    cmp_parser.add_argument("--flank-bp", type=int, default=2000, help="Flank size in bp for consensus mode (default: 2000)")
+    cmp_parser.add_argument("--flank-frac", type=float, default=0.5, help="Flank as fraction of TE length for relative mode (default: 0.5)")
     cmp_parser.add_argument("--mappability-bw", help="Mappability bigWig")
     cmp_parser.add_argument("--top-n", type=int, default=None, help="Only plot top N families")
 
     args = parser.parse_args()
 
     if args.command == "footprint-compare":
-        from .footprint import (load_repeatmasker_out, load_samples_file,
-                                extract_and_aggregate_by_condition, plot_footprint_comparison)
+        from .footprint import (load_repeatmasker_out, load_bed, load_samples_file,
+                                extract_and_aggregate_by_condition,
+                                extract_and_aggregate_by_condition_relative,
+                                plot_footprint_comparison)
+
+        if args.mode == "consensus" and not args.rm_out:
+            parser.error("--rm-out is required for consensus mode")
+        if args.mode == "relative" and not args.bed:
+            parser.error("--bed is required for relative mode")
 
         print(f"Loading samples: {args.samples}")
         samples = load_samples_file(args.samples)
         for cond, bams in samples.items():
             print(f"  {cond}: {len(bams)} samples")
 
-        print(f"Loading RepeatMasker .out: {args.rm_out}")
-        rm_df = load_repeatmasker_out(args.rm_out)
-        print(f"  {len(rm_df)} total TE loci")
-
         family_filter = None
         if args.families:
             family_filter = [f.strip() for f in args.families.split(",")]
             print(f"  Filtering to families: {family_filter}")
 
-        print("Extracting coverage per condition...")
-        condition_footprints = extract_and_aggregate_by_condition(
-            samples, rm_df,
-            family_filter=family_filter,
-            n_bins=args.n_bins,
-            flank_bp=args.flank_bp,
-            mappability_bw_path=getattr(args, 'mappability_bw', None),
-        )
+        map_bw = getattr(args, 'mappability_bw', None)
+
+        if args.mode == "consensus":
+            print(f"Loading RepeatMasker .out: {args.rm_out}")
+            rm_df = load_repeatmasker_out(args.rm_out)
+            print(f"  {len(rm_df)} total TE loci")
+            print(f"Mode: consensus coordinates")
+
+            condition_footprints = extract_and_aggregate_by_condition(
+                samples, rm_df,
+                family_filter=family_filter,
+                n_bins=args.n_bins,
+                flank_bp=args.flank_bp,
+                mappability_bw_path=map_bw,
+            )
+        else:
+            print(f"Loading BED: {args.bed}")
+            bed_df = load_bed(args.bed)
+            print(f"  {len(bed_df)} loci across {bed_df['te_family'].nunique()} families")
+            print(f"Mode: relative coordinates [0, 1]")
+
+            condition_footprints = extract_and_aggregate_by_condition_relative(
+                samples, bed_df,
+                family_filter=family_filter,
+                n_bins=args.n_bins,
+                flank_frac=args.flank_frac,
+                mappability_bw_path=map_bw,
+            )
 
         print(f"Plotting to {args.out_dir}/...")
         plot_footprint_comparison(condition_footprints, save_dir=args.out_dir,
