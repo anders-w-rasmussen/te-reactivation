@@ -650,6 +650,31 @@ def extract_coverage_bam(
     return result
 
 
+def _shrinkage_mean(mat: np.ndarray, prior_strength: float = 10.0) -> np.ndarray:
+    """
+    Empirical Bayes shrinkage mean across rows (loci) for each column (bin).
+
+    For each bin:
+      shrunk = (sum_of_values + prior_strength * global_mean) / (n_obs + prior_strength)
+
+    Bins with many observations → close to raw mean.
+    Bins with few observations → pulled toward global mean.
+    prior_strength controls how aggressively to shrink (higher = more shrinkage).
+    """
+    with np.errstate(all='ignore'):
+        # Global mean across all non-NaN values in the matrix
+        global_mean = np.nanmean(mat)
+        if np.isnan(global_mean):
+            return np.zeros(mat.shape[1], dtype=np.float32)
+
+        # Per-bin: sum and count of non-NaN values
+        n_obs = np.sum(~np.isnan(mat), axis=0).astype(np.float32)
+        bin_sums = np.nansum(mat, axis=0)
+
+        result = (bin_sums + prior_strength * global_mean) / (n_obs + prior_strength)
+        return np.nan_to_num(result, 0.0).astype(np.float32)
+
+
 def _resize_to_bins(vals: np.ndarray, n_bins: int) -> np.ndarray:
     """Resize a per-base array to n_bins by mean-pooling."""
     n = len(vals)
@@ -693,21 +718,15 @@ def compute_footprints(
         n_loci = sense_mat.shape[0]
         has_map = "mappability" in cov
 
-        # Aggregate — use nanmean/nanmedian so bins not covered by a copy
-        # (NaN) are excluded from the average rather than counted as zero
-        with np.errstate(all='ignore'):
-            sense_mean = np.nanmean(sense_mat, axis=0)
-            sense_median = np.nanmedian(sense_mat, axis=0)
-            antisense_mean = np.nanmean(antisense_mat, axis=0)
-            antisense_median = np.nanmedian(antisense_mat, axis=0)
-            mappability_mean = np.nanmean(cov["mappability"], axis=0) if has_map else None
-        # Replace any remaining NaN with 0
-        sense_mean = np.nan_to_num(sense_mean, 0.0)
-        sense_median = np.nan_to_num(sense_median, 0.0)
-        antisense_mean = np.nan_to_num(antisense_mean, 0.0)
-        antisense_median = np.nan_to_num(antisense_median, 0.0)
-        if mappability_mean is not None:
-            mappability_mean = np.nan_to_num(mappability_mean, 0.0)
+        # Aggregate with shrinkage: bins with few contributing copies
+        # are pulled toward the global mean (empirical Bayes pseudocount).
+        # This prevents spiky artifacts at consensus positions where only
+        # a handful of (mostly full-length) copies contribute.
+        sense_mean = _shrinkage_mean(sense_mat)
+        antisense_mean = _shrinkage_mean(antisense_mat)
+        sense_median = np.nan_to_num(np.nanmedian(sense_mat, axis=0), 0.0)
+        antisense_median = np.nan_to_num(np.nanmedian(antisense_mat, axis=0), 0.0)
+        mappability_mean = _shrinkage_mean(cov["mappability"]) if has_map else None
 
         # Background estimation
         if has_map:
@@ -725,9 +744,8 @@ def compute_footprints(
         bg_sense_5p = None
         bg_antisense_5p = None
         if "sense_5p" in cov:
-            with np.errstate(all='ignore'):
-                sense_5p_mean = np.nan_to_num(np.nanmean(cov["sense_5p"], axis=0), 0.0)
-                antisense_5p_mean = np.nan_to_num(np.nanmean(cov["antisense_5p"], axis=0), 0.0)
+            sense_5p_mean = _shrinkage_mean(cov["sense_5p"])
+            antisense_5p_mean = _shrinkage_mean(cov["antisense_5p"])
             if has_map:
                 bg_sense_5p = _estimate_background_mappability(
                     sense_5p_mean, mappability_mean, bin_centers, flank_frac)
