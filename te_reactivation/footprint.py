@@ -1067,3 +1067,266 @@ def plot_footprints(
 
     if save_dir:
         print(f"Footprints saved to {save_dir}/ ({len(scored)} families)")
+
+
+def load_samples_file(path: str) -> dict[str, list[str]]:
+    """
+    Load samples TSV: bam_path<TAB>condition
+    Returns dict: condition -> [list of bam paths]
+    """
+    conditions = {}
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("\t")
+            if len(parts) < 2:
+                continue
+            bam_path, condition = parts[0], parts[1]
+            conditions.setdefault(condition, []).append(bam_path)
+    return conditions
+
+
+def extract_and_aggregate_by_condition(
+    samples: dict[str, list[str]],
+    rm_df: pd.DataFrame,
+    family_filter: list[str] = None,
+    n_bins: int = 200,
+    flank_bp: int = 2000,
+    flank_bins: int = 50,
+    mappability_bw_path: str = None,
+) -> dict[str, dict[str, FamilyFootprint]]:
+    """
+    Run extract_coverage_consensus for each BAM, then aggregate
+    footprints per condition.
+
+    Returns dict: condition -> {family -> FamilyFootprint}
+    """
+    condition_footprints = {}
+
+    for condition, bam_paths in samples.items():
+        print(f"\n  Condition: {condition} ({len(bam_paths)} samples)")
+
+        # Collect per-family coverage matrices across all samples in this condition
+        merged = {}
+
+        for bam_path in bam_paths:
+            print(f"    Processing: {bam_path}")
+            coverages = extract_coverage_consensus(
+                bam_path, rm_df,
+                family_filter=family_filter,
+                n_bins=n_bins,
+                flank_bp=flank_bp,
+                flank_bins=flank_bins,
+                mappability_bw_path=mappability_bw_path,
+            )
+
+            for fam, cov in coverages.items():
+                if fam not in merged:
+                    merged[fam] = {k: [] for k in cov if k != "bin_centers"}
+                    merged[fam]["bin_centers"] = cov["bin_centers"]
+                for k in cov:
+                    if k != "bin_centers":
+                        merged[fam][k].append(cov[k])
+
+        # Stack all samples' loci together per family
+        for fam in merged:
+            for k in merged[fam]:
+                if k != "bin_centers" and isinstance(merged[fam][k], list):
+                    merged[fam][k] = np.concatenate(merged[fam][k], axis=0)
+
+        # Compute footprints for this condition
+        condition_footprints[condition] = compute_footprints(merged)
+
+    return condition_footprints
+
+
+def plot_footprint_comparison(
+    condition_footprints: dict[str, dict[str, FamilyFootprint]],
+    save_dir: str = None,
+    top_n: int = None,
+):
+    """
+    Plot overlaid footprints for two conditions per family.
+
+    Each family gets a 5-panel plot with both conditions overlaid:
+    1. Sense coverage
+    2. Antisense coverage
+    3. Strand asymmetry
+    4. Sense 5' ends
+    5. Antisense 5' ends
+    """
+    import matplotlib.pyplot as plt
+
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+
+    conditions = list(condition_footprints.keys())
+    colors = {
+        conditions[0]: {"sense": "#2166ac", "antisense": "#b2182b", "diff": "#7570b3"},
+    }
+    if len(conditions) > 1:
+        colors[conditions[1]] = {"sense": "#d6604d", "antisense": "#4393c3", "diff": "#e08214"}
+
+    # Get all families present in any condition
+    all_families = set()
+    for cond_fps in condition_footprints.values():
+        all_families.update(cond_fps.keys())
+
+    # Sort by enrichment difference between conditions (if two conditions)
+    scored = []
+    for fam in all_families:
+        fps = {c: condition_footprints[c].get(fam) for c in conditions}
+        if all(fp is None for fp in fps.values()):
+            continue
+        # Score by max sense enrichment across conditions
+        max_enrich = 0
+        for fp in fps.values():
+            if fp is not None:
+                te_mask = (fp.bin_centers >= 0) if fp.bin_centers.max() <= 2 else (fp.bin_centers >= 1)
+                max_enrich = max(max_enrich, np.maximum(fp.sense_mean[te_mask] - fp.bg_sense[te_mask], 0).mean())
+        scored.append((fam, max_enrich))
+    scored.sort(key=lambda x: -x[1])
+
+    if top_n:
+        scored = scored[:top_n]
+
+    for fam, _ in scored:
+        fps = {c: condition_footprints[c].get(fam) for c in conditions}
+        # Use the first available footprint for bin_centers / coordinate detection
+        ref_fp = next(fp for fp in fps.values() if fp is not None)
+        bc = ref_fp.bin_centers
+
+        is_consensus = bc.max() > 10
+        if is_consensus:
+            te_start_x = 1
+            te_end_x = bc.max() + bc.min()
+            x_label = "Consensus position (bp)"
+        else:
+            te_start_x = 0
+            te_end_x = 1
+            x_label = "Relative position (0 = TE 5', 1 = TE 3')"
+
+        has_5p = ref_fp.sense_5p_mean is not None
+        n_panels = 5 if has_5p else 3
+        fig, axes = plt.subplots(n_panels, 1, figsize=(14, 4 * n_panels))
+
+        def _shade_te(ax):
+            ax.axvspan(te_start_x, te_end_x, alpha=0.06, color="#333")
+            ax.axvline(te_start_x, color="#333", linewidth=0.8, alpha=0.4)
+            ax.axvline(te_end_x, color="#333", linewidth=0.8, alpha=0.4)
+
+        # Panel 1: Sense coverage
+        ax = axes[0]
+        _shade_te(ax)
+        for cond in conditions:
+            fp = fps.get(cond)
+            if fp is None:
+                continue
+            c = colors[cond]["sense"]
+            ax.plot(fp.bin_centers, fp.sense_mean, color=c, linewidth=1.5,
+                    label=f"{cond} (n={fp.n_loci})", alpha=0.9)
+            ax.fill_between(fp.bin_centers, fp.sense_mean, alpha=0.15, color=c)
+        ax.axhline(0, color="black", linewidth=0.5)
+        ax.set_ylabel("Mean coverage (CPM)", fontsize=10)
+        ax.set_title("Sense strand", fontsize=11)
+        ax.legend(fontsize=9, loc="upper right")
+        ax.text(te_start_x, 1.03, "5'", transform=ax.get_xaxis_transform(),
+                fontsize=11, fontweight="bold", ha="center")
+        ax.text(te_end_x, 1.03, "3'", transform=ax.get_xaxis_transform(),
+                fontsize=11, fontweight="bold", ha="center")
+
+        # Panel 2: Antisense coverage
+        ax = axes[1]
+        _shade_te(ax)
+        for cond in conditions:
+            fp = fps.get(cond)
+            if fp is None:
+                continue
+            c = colors[cond]["antisense"]
+            ax.plot(fp.bin_centers, fp.antisense_mean, color=c, linewidth=1.5,
+                    label=f"{cond}", alpha=0.9)
+            ax.fill_between(fp.bin_centers, fp.antisense_mean, alpha=0.15, color=c)
+        ax.axhline(0, color="black", linewidth=0.5)
+        ax.set_ylabel("Mean coverage (CPM)", fontsize=10)
+        ax.set_title("Antisense strand", fontsize=11)
+        ax.legend(fontsize=9, loc="upper right")
+
+        # Panel 3: Strand asymmetry
+        ax = axes[2]
+        _shade_te(ax)
+        for cond in conditions:
+            fp = fps.get(cond)
+            if fp is None:
+                continue
+            c = colors[cond]["diff"]
+            diff = fp.sense_mean - fp.antisense_mean
+            ax.plot(fp.bin_centers, diff, color=c, linewidth=1.5,
+                    label=f"{cond}", alpha=0.9)
+            ax.fill_between(fp.bin_centers, diff, alpha=0.15, color=c)
+        ax.axhline(0, color="black", linewidth=0.8, linestyle=":")
+        ax.set_ylabel("Sense - Antisense (CPM)", fontsize=10)
+        ax.set_title("Strand asymmetry", fontsize=11)
+        ax.legend(fontsize=9, loc="upper right")
+
+        # Panel 4: Sense 5' ends
+        if has_5p:
+            ax = axes[3]
+            _shade_te(ax)
+            for cond in conditions:
+                fp = fps.get(cond)
+                if fp is None or fp.sense_5p_mean is None:
+                    continue
+                c = colors[cond]["sense"]
+                ax.plot(fp.bin_centers, fp.sense_5p_mean, color=c, linewidth=1.5,
+                        label=f"{cond}", alpha=0.9)
+                ax.fill_between(fp.bin_centers, fp.sense_5p_mean, alpha=0.15, color=c)
+            ax.axhline(0, color="black", linewidth=0.5)
+            ax.set_ylabel("Mean 5' ends per locus", fontsize=10)
+            ax.set_title("Sense read 5' ends", fontsize=11)
+            ax.legend(fontsize=9, loc="upper right")
+
+            # Panel 5: Antisense 5' ends
+            ax = axes[4]
+            _shade_te(ax)
+            for cond in conditions:
+                fp = fps.get(cond)
+                if fp is None or fp.antisense_5p_mean is None:
+                    continue
+                c = colors[cond]["antisense"]
+                ax.plot(fp.bin_centers, fp.antisense_5p_mean, color=c, linewidth=1.5,
+                        label=f"{cond}", alpha=0.9)
+                ax.fill_between(fp.bin_centers, fp.antisense_5p_mean, alpha=0.15, color=c)
+            ax.axhline(0, color="black", linewidth=0.5)
+            ax.set_ylabel("Mean 5' ends per locus", fontsize=10)
+            ax.set_xlabel(x_label, fontsize=10)
+            ax.set_title("Antisense read 5' ends", fontsize=11)
+            ax.legend(fontsize=9, loc="upper right")
+
+        if not has_5p:
+            axes[2].set_xlabel(x_label, fontsize=10)
+
+        # Get sample counts per condition
+        counts_str = "   |   ".join(
+            f"{c}: {fps[c].n_loci} loci" if fps.get(c) else f"{c}: 0 loci"
+            for c in conditions
+        )
+        fig.suptitle(
+            f"{fam}   |   {counts_str}",
+            fontsize=13, fontweight="bold", y=1.01,
+        )
+
+        plt.tight_layout()
+
+        if save_dir:
+            safe = fam.replace("/", "_").replace(" ", "_")
+            path = os.path.join(save_dir, f"compare_{safe}.png")
+            plt.savefig(path, dpi=150, bbox_inches="tight")
+            plt.close()
+        else:
+            plt.show()
+            plt.close()
+
+    if save_dir:
+        print(f"Comparison plots saved to {save_dir}/ ({len(scored)} families)")
