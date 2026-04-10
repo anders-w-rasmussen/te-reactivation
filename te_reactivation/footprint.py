@@ -1194,20 +1194,58 @@ def extract_and_aggregate_by_condition_relative(
     return condition_footprints
 
 
+def _smooth(signal: np.ndarray, window: int = 5) -> np.ndarray:
+    """Smooth a signal with a rolling mean."""
+    if window <= 1 or len(signal) < window:
+        return signal
+    kernel = np.ones(window) / window
+    return np.convolve(signal, kernel, mode="same").astype(np.float32)
+
+
+def _flank_normalize(fps: dict, conditions: list, bc: np.ndarray,
+                     te_start_x: float, te_end_x: float):
+    """
+    Normalize each condition so flank levels align.
+    Computes mean flank coverage (sense + antisense) for each condition,
+    then shifts all signals so flanks match the first condition.
+    Returns dict of shift values per condition.
+    """
+    flank_mask = (bc < te_start_x) | (bc > te_end_x)
+    if not flank_mask.any():
+        return {c: 0.0 for c in conditions}
+
+    flank_means = {}
+    for cond in conditions:
+        fp = fps.get(cond)
+        if fp is None:
+            flank_means[cond] = 0.0
+            continue
+        flank_means[cond] = (fp.sense_mean[flank_mask].mean() +
+                             fp.antisense_mean[flank_mask].mean()) / 2
+
+    # Normalize to first condition's flank level
+    ref_mean = flank_means[conditions[0]]
+    scales = {}
+    for cond in conditions:
+        if flank_means[cond] > 1e-10:
+            scales[cond] = ref_mean / flank_means[cond]
+        else:
+            scales[cond] = 1.0
+    return scales
+
+
 def plot_footprint_comparison(
     condition_footprints: dict[str, dict[str, FamilyFootprint]],
     save_dir: str = None,
     top_n: int = None,
+    smooth_window: int = 7,
+    normalize_flanks: bool = True,
 ):
     """
     Plot overlaid footprints for two conditions per family.
 
-    Each family gets a 5-panel plot with both conditions overlaid:
-    1. Sense coverage
-    2. Antisense coverage
-    3. Strand asymmetry
-    4. Sense 5' ends
-    5. Antisense 5' ends
+    Signals are smoothed and flank-normalized so conditions are
+    directly comparable regardless of sequencing depth differences.
     """
     import matplotlib.pyplot as plt
     import os
@@ -1227,13 +1265,12 @@ def plot_footprint_comparison(
     for cond_fps in condition_footprints.values():
         all_families.update(cond_fps.keys())
 
-    # Sort by enrichment difference between conditions (if two conditions)
+    # Sort by enrichment difference between conditions
     scored = []
     for fam in all_families:
         fps = {c: condition_footprints[c].get(fam) for c in conditions}
         if all(fp is None for fp in fps.values()):
             continue
-        # Score by max sense enrichment across conditions
         max_enrich = 0
         for fp in fps.values():
             if fp is not None:
@@ -1247,7 +1284,6 @@ def plot_footprint_comparison(
 
     for fam, _ in scored:
         fps = {c: condition_footprints[c].get(fam) for c in conditions}
-        # Use the first available footprint for bin_centers / coordinate detection
         ref_fp = next(fp for fp in fps.values() if fp is not None)
         bc = ref_fp.bin_centers
 
@@ -1260,6 +1296,12 @@ def plot_footprint_comparison(
             te_start_x = 0
             te_end_x = 1
             x_label = "Relative position (0 = TE 5', 1 = TE 3')"
+
+        # Flank normalization
+        if normalize_flanks:
+            scales = _flank_normalize(fps, conditions, bc, te_start_x, te_end_x)
+        else:
+            scales = {c: 1.0 for c in conditions}
 
         has_5p = ref_fp.sense_5p_mean is not None
         n_panels = 5 if has_5p else 3
@@ -1278,11 +1320,13 @@ def plot_footprint_comparison(
             if fp is None:
                 continue
             c = colors[cond]["sense"]
-            ax.plot(fp.bin_centers, fp.sense_mean, color=c, linewidth=1.5,
+            s = scales[cond]
+            y = _smooth(fp.sense_mean * s, smooth_window)
+            ax.plot(fp.bin_centers, y, color=c, linewidth=1.5,
                     label=f"{cond} (n={fp.n_loci})", alpha=0.9)
-            ax.fill_between(fp.bin_centers, fp.sense_mean, alpha=0.15, color=c)
+            ax.fill_between(fp.bin_centers, y, alpha=0.15, color=c)
         ax.axhline(0, color="black", linewidth=0.5)
-        ax.set_ylabel("Mean coverage (CPM)", fontsize=10)
+        ax.set_ylabel("Mean coverage (normalized)", fontsize=10)
         ax.set_title("Sense strand", fontsize=11)
         ax.legend(fontsize=9, loc="upper right")
         ax.text(te_start_x, 1.03, "5'", transform=ax.get_xaxis_transform(),
@@ -1298,11 +1342,13 @@ def plot_footprint_comparison(
             if fp is None:
                 continue
             c = colors[cond]["antisense"]
-            ax.plot(fp.bin_centers, fp.antisense_mean, color=c, linewidth=1.5,
+            s = scales[cond]
+            y = _smooth(fp.antisense_mean * s, smooth_window)
+            ax.plot(fp.bin_centers, y, color=c, linewidth=1.5,
                     label=f"{cond}", alpha=0.9)
-            ax.fill_between(fp.bin_centers, fp.antisense_mean, alpha=0.15, color=c)
+            ax.fill_between(fp.bin_centers, y, alpha=0.15, color=c)
         ax.axhline(0, color="black", linewidth=0.5)
-        ax.set_ylabel("Mean coverage (CPM)", fontsize=10)
+        ax.set_ylabel("Mean coverage (normalized)", fontsize=10)
         ax.set_title("Antisense strand", fontsize=11)
         ax.legend(fontsize=9, loc="upper right")
 
@@ -1314,12 +1360,13 @@ def plot_footprint_comparison(
             if fp is None:
                 continue
             c = colors[cond]["diff"]
-            diff = fp.sense_mean - fp.antisense_mean
+            s = scales[cond]
+            diff = _smooth((fp.sense_mean - fp.antisense_mean) * s, smooth_window)
             ax.plot(fp.bin_centers, diff, color=c, linewidth=1.5,
                     label=f"{cond}", alpha=0.9)
             ax.fill_between(fp.bin_centers, diff, alpha=0.15, color=c)
         ax.axhline(0, color="black", linewidth=0.8, linestyle=":")
-        ax.set_ylabel("Sense - Antisense (CPM)", fontsize=10)
+        ax.set_ylabel("Sense - Antisense (normalized)", fontsize=10)
         ax.set_title("Strand asymmetry", fontsize=11)
         ax.legend(fontsize=9, loc="upper right")
 
@@ -1332,9 +1379,11 @@ def plot_footprint_comparison(
                 if fp is None or fp.sense_5p_mean is None:
                     continue
                 c = colors[cond]["sense"]
-                ax.plot(fp.bin_centers, fp.sense_5p_mean, color=c, linewidth=1.5,
+                s = scales[cond]
+                y = _smooth(fp.sense_5p_mean * s, smooth_window)
+                ax.plot(fp.bin_centers, y, color=c, linewidth=1.5,
                         label=f"{cond}", alpha=0.9)
-                ax.fill_between(fp.bin_centers, fp.sense_5p_mean, alpha=0.15, color=c)
+                ax.fill_between(fp.bin_centers, y, alpha=0.15, color=c)
             ax.axhline(0, color="black", linewidth=0.5)
             ax.set_ylabel("Mean 5' ends per locus", fontsize=10)
             ax.set_title("Sense read 5' ends", fontsize=11)
@@ -1348,9 +1397,11 @@ def plot_footprint_comparison(
                 if fp is None or fp.antisense_5p_mean is None:
                     continue
                 c = colors[cond]["antisense"]
-                ax.plot(fp.bin_centers, fp.antisense_5p_mean, color=c, linewidth=1.5,
+                s = scales[cond]
+                y = _smooth(fp.antisense_5p_mean * s, smooth_window)
+                ax.plot(fp.bin_centers, y, color=c, linewidth=1.5,
                         label=f"{cond}", alpha=0.9)
-                ax.fill_between(fp.bin_centers, fp.antisense_5p_mean, alpha=0.15, color=c)
+                ax.fill_between(fp.bin_centers, y, alpha=0.15, color=c)
             ax.axhline(0, color="black", linewidth=0.5)
             ax.set_ylabel("Mean 5' ends per locus", fontsize=10)
             ax.set_xlabel(x_label, fontsize=10)

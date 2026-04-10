@@ -76,7 +76,7 @@ def main():
     cmp_parser.add_argument("--bed", help="BED file (required for relative mode)")
     cmp_parser.add_argument("--n-bins", type=int, default=200, help="Bins across TE body (default: 200)")
     cmp_parser.add_argument("--flank-bp", type=int, default=2000, help="Flank size in bp for consensus mode (default: 2000)")
-    cmp_parser.add_argument("--flank-frac", type=float, default=0.5, help="Flank as fraction of TE length for relative mode (default: 0.5)")
+    cmp_parser.add_argument("--flank-frac", type=float, default=1.0, help="Flank as fraction of TE length for relative mode (default: 1.0)")
     cmp_parser.add_argument("--mappability-bw", help="Mappability bigWig")
     cmp_parser.add_argument("--top-n", type=int, default=None, help="Only plot top N families")
 
