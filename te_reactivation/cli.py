@@ -6,6 +6,7 @@ import argparse
 import sys
 import json
 import numpy as np
+import pandas as pd
 
 from .data import load_bed, count_reads_from_bam, aggregate_by_family
 from .inference import run_svi, summarize_results
@@ -80,6 +81,22 @@ def main():
     cmp_parser.add_argument("--mappability-bw", help="Mappability bigWig")
     cmp_parser.add_argument("--top-n", type=int, default=None, help="Only plot top N families")
 
+    # ---- rt-null: test autonomous transcription vs readthrough using RT length null model ----
+    rtn_parser = subparsers.add_parser("rt-null",
+        help="Test autonomous TE transcription using RT length null model")
+    rtn_parser.add_argument("--bam", required=True, help="Aligned BAM file (indexed)")
+    rtn_parser.add_argument("--bed", required=True, help="TE BED file (5-col: chrom start stop name strand)")
+    rtn_parser.add_argument("--genes-bed", required=True,
+        help="Genes BED file (5-col: chrom start stop name strand) for learning RT distribution")
+    rtn_parser.add_argument("--out-dir", "-o", required=True, help="Output directory")
+    rtn_parser.add_argument("--families", help="Comma-separated TE family names to test")
+    rtn_parser.add_argument("--min-gene-length", type=int, default=5000,
+        help="Min gene length for RT learning (default: 5000)")
+    rtn_parser.add_argument("--n-bins", type=int, default=100, help="Bins across TE body (default: 100)")
+    rtn_parser.add_argument("--flank-frac", type=float, default=0.5, help="Flank fraction (default: 0.5)")
+    rtn_parser.add_argument("--n-sim", type=int, default=50000, help="Simulated reads for null (default: 50000)")
+    rtn_parser.add_argument("--n-permutations", type=int, default=10000, help="Permutations for p-value (default: 10000)")
+
     # ---- polyA-background: build artifact footprint from genomic polyA sites ----
     pa_parser = subparsers.add_parser("polya-background",
         help="Build background footprint from genomic polyA sites (artifact profile)")
@@ -97,7 +114,113 @@ def main():
 
     args = parser.parse_args()
 
-    if args.command == "polya-background":
+    if args.command == "rt-null":
+        from .rt_null import (learn_rt_length_distribution, simulate_null_footprint,
+                              test_autonomous_transcription, plot_rt_null_analysis)
+        from .footprint import load_bed as fp_load_bed, extract_coverage_bam, compute_footprints
+        import os
+
+        os.makedirs(args.out_dir, exist_ok=True)
+
+        # Step 1: Learn RT length distribution from genes
+        print("Step 1: Learning RT length distribution from long genes...")
+        rt_lengths = learn_rt_length_distribution(
+            args.bam, args.genes_bed,
+            min_gene_length=args.min_gene_length,
+        )
+
+        if len(rt_lengths) == 0:
+            print("ERROR: No RT lengths could be learned. Check BAM/genes BED.")
+            sys.exit(1)
+
+        # Save RT distribution
+        rt_path = os.path.join(args.out_dir, "rt_length_distribution.npz")
+        np.savez(rt_path, rt_lengths=rt_lengths)
+        print(f"RT distribution saved to {rt_path}")
+
+        # Plot RT distribution
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.hist(rt_lengths, bins=100, color="#7570b3", alpha=0.7, edgecolor="white")
+        ax.axvline(np.median(rt_lengths), color="red", linestyle="--",
+                   label=f"Median: {np.median(rt_lengths):.0f}bp")
+        ax.set_xlabel("RT/cDNA length (bp)")
+        ax.set_ylabel("Count")
+        ax.set_title(f"RT length distribution (n={len(rt_lengths)} reads)")
+        ax.legend()
+        plt.tight_layout()
+        plt.savefig(os.path.join(args.out_dir, "rt_length_distribution.png"), dpi=150)
+        plt.close()
+
+        # Step 2: Extract observed footprints
+        print("\nStep 2: Extracting observed TE footprints...")
+        bed_df = fp_load_bed(args.bed)
+        family_filter = None
+        if args.families:
+            family_filter = [f.strip() for f in args.families.split(",")]
+            bed_df = bed_df[bed_df["te_family"].isin(family_filter)]
+
+        coverages = extract_coverage_bam(
+            args.bam, bed_df,
+            n_bins=args.n_bins, flank_frac=args.flank_frac,
+        )
+        footprints = compute_footprints(coverages, flank_frac=args.flank_frac)
+
+        # Step 3: For each family, simulate null and test
+        print("\nStep 3: Testing each family against RT null model...")
+        results_rows = []
+
+        for fam, fp in footprints.items():
+            if fp.sense_5p_mean is None:
+                print(f"  {fam}: skipping (no 5' end data)")
+                continue
+
+            # Estimate median TE length for this family
+            fam_bed = bed_df[bed_df["te_family"] == fam]
+            median_te_len = int((fam_bed["stop"] - fam_bed["start"]).median())
+
+            print(f"  {fam}: {fp.n_loci} loci, median length {median_te_len}bp")
+
+            # Simulate null
+            null = simulate_null_footprint(
+                rt_lengths, te_length=median_te_len,
+                n_bins=args.n_bins, flank_frac=args.flank_frac,
+                n_sim=args.n_sim,
+            )
+
+            # Test
+            test = test_autonomous_transcription(
+                fp.sense_5p_mean, null["fivep_density"],
+                null["bin_centers"],
+                n_permutations=args.n_permutations,
+            )
+
+            print(f"    Enrichment: {test['enrichment_ratio']:.2f}x, "
+                  f"p = {test['p_value']:.4f}")
+
+            results_rows.append({
+                "family": fam,
+                "n_loci": fp.n_loci,
+                "median_te_length": median_te_len,
+                "enrichment_ratio": test["enrichment_ratio"],
+                "p_value": test["p_value"],
+                "test_statistic": test["test_statistic"],
+            })
+
+            # Plot
+            plot_path = os.path.join(args.out_dir, f"rt_null_{fam}.png")
+            plot_rt_null_analysis(fp, null, test, fam, save_path=plot_path)
+
+        # Save summary
+        if results_rows:
+            results_df = pd.DataFrame(results_rows).sort_values("p_value")
+            tsv_path = os.path.join(args.out_dir, "rt_null_results.tsv")
+            results_df.to_csv(tsv_path, sep="\t", index=False)
+            print(f"\nResults saved to {tsv_path}")
+
+    elif args.command == "polya-background":
         from .footprint import extract_polyA_background, plot_polyA_background
         import os, json
 
