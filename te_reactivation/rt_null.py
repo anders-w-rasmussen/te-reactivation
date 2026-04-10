@@ -143,6 +143,37 @@ def learn_rt_length_distribution(
     return rt_lengths
 
 
+def fit_rt_distribution(rt_lengths: np.ndarray) -> dict:
+    """
+    Fit a log-normal distribution to the empirical RT lengths.
+
+    Returns dict with fitted parameters and a sampling function.
+    The log-normal produces a smooth, continuous distribution without
+    the transcript-specific spikes present in the raw empirical data.
+    """
+    from scipy import stats
+
+    # Filter outliers (top 1%) for cleaner fit
+    cap = np.percentile(rt_lengths, 99)
+    filtered = rt_lengths[rt_lengths <= cap]
+
+    # Fit log-normal
+    shape, loc, scale = stats.lognorm.fit(filtered, floc=0)
+
+    fitted_median = np.exp(np.log(scale))
+    fitted_mean = np.exp(np.log(scale) + shape**2 / 2)
+
+    print(f"  Fitted log-normal: shape={shape:.3f}, scale={scale:.0f}")
+    print(f"  Fitted median: {fitted_median:.0f}bp, mean: {fitted_mean:.0f}bp")
+
+    return {
+        "shape": shape,
+        "loc": loc,
+        "scale": scale,
+        "distribution": stats.lognorm(shape, loc=loc, scale=scale),
+    }
+
+
 def simulate_null_footprint(
     rt_lengths: np.ndarray,
     te_length: int,
@@ -156,7 +187,8 @@ def simulate_null_footprint(
 
     Null model: every read terminates at the TE 3' end (position = te_length),
     and originated from far upstream. The read's 5' end is determined by
-    drawing an RT length from the empirical distribution.
+    drawing an RT length from a log-normal fit to the empirical distribution.
+    This ensures the null is smooth (no transcript-specific spikes).
 
     For each simulated read:
       - 3' end is at position te_length (the TE 3' end)
@@ -185,8 +217,13 @@ def simulate_null_footprint(
         "coverage": (total_bins,) expected coverage profile
         "fivep_density": (total_bins,) expected 5' end density
         "bin_centers": (total_bins,) relative positions
+        "rt_fit": dict with fitted distribution parameters
     """
     rng = np.random.default_rng(seed)
+
+    # Fit smooth distribution to RT lengths
+    rt_fit = fit_rt_distribution(rt_lengths)
+    dist = rt_fit["distribution"]
 
     flank_bp = int(te_length * flank_frac)
     flank_bins = int(n_bins * flank_frac)
@@ -201,8 +238,8 @@ def simulate_null_footprint(
     coverage = np.zeros(total_bins, dtype=np.float64)
     fivep_density = np.zeros(total_bins, dtype=np.float64)
 
-    # Sample RT lengths
-    sampled_rt = rng.choice(rt_lengths, size=n_sim, replace=True)
+    # Sample RT lengths from fitted log-normal
+    sampled_rt = dist.rvs(size=n_sim, random_state=rng)
 
     for rt_len in sampled_rt:
         # Read spans from (te_length - rt_len) to te_length
@@ -228,6 +265,7 @@ def simulate_null_footprint(
         "bin_centers": bin_centers.astype(np.float32),
         "bin_centers_bp": bin_centers_bp.astype(np.float32),
         "te_length": te_length,
+        "rt_fit": rt_fit,
     }
 
 
