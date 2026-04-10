@@ -190,9 +190,10 @@ def main():
                 n_sim=args.n_sim,
             )
 
-            # Test
+            # Test — anchor null to observed coverage at TE 3' end
             test = test_autonomous_transcription(
-                fp.sense_5p_mean, null["fivep_density"],
+                fp.sense_5p_mean, fp.sense_mean,
+                null["fivep_density"], null["coverage"],
                 null["bin_centers"],
                 n_permutations=args.n_permutations,
             )

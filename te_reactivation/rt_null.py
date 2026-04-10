@@ -233,7 +233,9 @@ def simulate_null_footprint(
 
 def test_autonomous_transcription(
     observed_5p: np.ndarray,
+    observed_coverage: np.ndarray,
     null_5p: np.ndarray,
+    null_coverage: np.ndarray,
     bin_centers: np.ndarray,
     te_body_range: tuple = (0.0, 1.0),
     n_permutations: int = 10000,
@@ -243,15 +245,20 @@ def test_autonomous_transcription(
     Test whether observed 5' end density inside the TE body exceeds
     the null model prediction.
 
-    Test statistic: ratio of observed to expected 5' end density
-    inside the TE body, relative to the flanking region.
+    Scaling: the null is anchored to the observed coverage at the TE
+    3' end (position ~1.0), since both models agree reads terminate
+    there — they only disagree about where reads originated.
 
     Parameters
     ----------
     observed_5p : np.ndarray
         Observed 5' end density per bin (from footprint).
+    observed_coverage : np.ndarray
+        Observed sense coverage per bin (from footprint).
     null_5p : np.ndarray
         Null model 5' end density per bin (from simulate_null_footprint).
+    null_coverage : np.ndarray
+        Null model coverage per bin (from simulate_null_footprint).
     bin_centers : np.ndarray
         Bin center positions (relative coords).
     te_body_range : tuple
@@ -272,13 +279,14 @@ def test_autonomous_transcription(
     rng = np.random.default_rng(seed)
 
     te_mask = (bin_centers >= te_body_range[0]) & (bin_centers <= te_body_range[1])
-    flank_mask = ~te_mask
 
-    # Normalize null to match observed in flanking regions
-    obs_flank = observed_5p[flank_mask].mean()
-    null_flank = null_5p[flank_mask].mean()
-    if null_flank > 0:
-        scale = obs_flank / null_flank
+    # Scale null to match observed at the TE 3' end.
+    # Use a small window near position 1.0 for robustness.
+    threep_mask = (bin_centers >= 0.85) & (bin_centers <= 1.0)
+    obs_3p = observed_coverage[threep_mask].mean() if threep_mask.any() else 1.0
+    null_3p = null_coverage[threep_mask].mean() if threep_mask.any() else 1.0
+    if null_3p > 0:
+        scale = obs_3p / null_3p
     else:
         scale = 1.0
     null_scaled = null_5p * scale
@@ -345,15 +353,16 @@ def plot_rt_null_analysis(
     ax.axvline(0, color="#333", linewidth=0.8, alpha=0.4)
     ax.axvline(1, color="#333", linewidth=0.8, alpha=0.4)
 
-    # Scale null coverage to match observed in flanks
+    # Scale null coverage to match observed at TE 3' end
     obs_sense = observed_footprint.sense_mean
     obs_bc = observed_footprint.bin_centers
-    flank_mask_obs = (obs_bc < 0) | (obs_bc > 1)
     null_cov = null_result["coverage"]
-    null_flank_cov = null_cov[(bc < 0) | (bc > 1)].mean()
-    obs_flank_cov = obs_sense[flank_mask_obs].mean()
-    if null_flank_cov > 0:
-        cov_scale = obs_flank_cov / null_flank_cov
+    threep_mask_obs = (obs_bc >= 0.85) & (obs_bc <= 1.0)
+    threep_mask_null = (bc >= 0.85) & (bc <= 1.0)
+    obs_3p = obs_sense[threep_mask_obs].mean() if threep_mask_obs.any() else 1.0
+    null_3p = null_cov[threep_mask_null].mean() if threep_mask_null.any() else 1.0
+    if null_3p > 0:
+        cov_scale = obs_3p / null_3p
     else:
         cov_scale = 1.0
 
