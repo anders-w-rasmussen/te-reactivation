@@ -126,9 +126,9 @@ def learn_rt_length_distribution(
             if abs(read_3p - polyA_pos) > polyA_window:
                 continue
 
-            # RT length = aligned length of the read
-            rt_len = read.reference_end - read.reference_start
-            if rt_len > 0:
+            # RT length = actual sequenced read/cDNA length
+            rt_len = read.query_length
+            if rt_len is not None and rt_len > 0:
                 rt_lengths.append(rt_len)
 
     bam.close()
