@@ -80,9 +80,79 @@ def main():
     cmp_parser.add_argument("--mappability-bw", help="Mappability bigWig")
     cmp_parser.add_argument("--top-n", type=int, default=None, help="Only plot top N families")
 
+    # ---- polyA-background: build artifact footprint from genomic polyA sites ----
+    pa_parser = subparsers.add_parser("polya-background",
+        help="Build background footprint from genomic polyA sites (artifact profile)")
+    pa_parser.add_argument("--bam", required=True, help="Aligned BAM file (indexed)")
+    pa_parser.add_argument("--ref", required=True, help="Reference FASTA (indexed, e.g. hg38.fa)")
+    pa_parser.add_argument("--out-dir", "-o", required=True, help="Output directory")
+    pa_parser.add_argument("--min-a", type=int, default=6, help="Minimum consecutive A's to define a polyA site (default: 6)")
+    pa_parser.add_argument("--upstream-bp", type=int, default=800, help="Window upstream of polyA to profile (default: 800)")
+    pa_parser.add_argument("--n-bins", type=int, default=100, help="Number of bins (default: 100)")
+    pa_parser.add_argument("--max-sites", type=int, default=5000, help="Max polyA sites to sample (default: 5000)")
+    pa_parser.add_argument("--exclude-genes", help="Genes BED file to exclude (optional)")
+    pa_parser.add_argument("--exclude-tes", help="RepeatMasker BED file to exclude (optional)")
+    pa_parser.add_argument("--chroms", help="Comma-separated chromosomes to scan (default: chr1-22,X,Y)")
+    pa_parser.add_argument("--seed", type=int, default=42, help="Random seed for subsampling")
+
     args = parser.parse_args()
 
-    if args.command == "footprint-compare":
+    if args.command == "polya-background":
+        from .footprint import extract_polyA_background, plot_polyA_background
+        import os, json
+
+        exclude_beds = []
+        if args.exclude_genes:
+            exclude_beds.append(args.exclude_genes)
+        if args.exclude_tes:
+            exclude_beds.append(args.exclude_tes)
+
+        chroms = None
+        if args.chroms:
+            chroms = [c.strip() for c in args.chroms.split(",")]
+
+        bg = extract_polyA_background(
+            bam_path=args.bam,
+            ref_path=args.ref,
+            min_a_count=args.min_a,
+            upstream_bp=args.upstream_bp,
+            n_bins=args.n_bins,
+            max_sites=args.max_sites,
+            exclude_beds=exclude_beds if exclude_beds else None,
+            seed=args.seed,
+            chroms=chroms,
+        )
+
+        os.makedirs(args.out_dir, exist_ok=True)
+
+        # Save plot
+        plot_path = os.path.join(args.out_dir, "polya_background_footprint.png")
+        plot_polyA_background(bg, save_path=plot_path)
+
+        # Save arrays for reuse
+        npz_path = os.path.join(args.out_dir, "polya_background.npz")
+        np.savez(npz_path,
+                 sense_mean=bg["sense_mean"],
+                 sense_median=bg["sense_median"],
+                 antisense_mean=bg["antisense_mean"],
+                 antisense_median=bg["antisense_median"],
+                 sense_5p_mean=bg["sense_5p_mean"],
+                 antisense_5p_mean=bg["antisense_5p_mean"],
+                 bin_centers=bg["bin_centers"],
+                 polyA_lengths=np.array(bg["polyA_lengths"]),
+        )
+        print(f"Background arrays saved to {npz_path}")
+
+        # Save metadata
+        meta = {"n_sites": bg["n_sites"], "min_a": args.min_a,
+                "upstream_bp": args.upstream_bp, "n_bins": args.n_bins,
+                "median_polyA_length": float(np.median(bg["polyA_lengths"]))}
+        meta_path = os.path.join(args.out_dir, "polya_background_meta.json")
+        with open(meta_path, "w") as f:
+            json.dump(meta, f, indent=2)
+        print(f"Metadata saved to {meta_path}")
+
+    elif args.command == "footprint-compare":
         from .footprint import (load_repeatmasker_out, load_bed, load_samples_file,
                                 extract_and_aggregate_by_condition,
                                 extract_and_aggregate_by_condition_relative,

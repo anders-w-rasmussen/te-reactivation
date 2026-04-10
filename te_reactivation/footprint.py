@@ -1069,6 +1069,288 @@ def plot_footprints(
         print(f"Footprints saved to {save_dir}/ ({len(scored)} families)")
 
 
+def scan_polyA_sites(
+    ref_path: str,
+    min_a_count: int = 6,
+    exclude_beds: list[str] = None,
+    max_sites: int = 5000,
+    seed: int = 42,
+    chroms: list[str] = None,
+) -> pd.DataFrame:
+    """
+    Scan reference genome for polyA stretches (runs of ≥min_a_count A's or T's).
+    Optionally exclude regions overlapping BED files (genes, TEs).
+
+    Returns DataFrame with columns: chrom, start, stop, strand
+    where strand indicates the poly-A direction (+ = A-run, - = T-run on fwd strand).
+    The 'stop' position is the 3' end of the polyA (where a read would terminate).
+    """
+    import re
+    from pyfaidx import Fasta
+
+    ref = Fasta(ref_path)
+    valid_chroms = chroms or [f"chr{i}" for i in range(1, 23)] + ["chrX", "chrY"]
+
+    sites = []
+    for chrom in valid_chroms:
+        if chrom not in ref:
+            continue
+        seq = str(ref[chrom]).upper()
+        # A-runs on + strand
+        for m in re.finditer(f'A{{{min_a_count},}}', seq):
+            sites.append({"chrom": chrom, "start": m.start(), "stop": m.end(), "strand": "+"})
+        # T-runs on + strand = A-runs on - strand
+        for m in re.finditer(f'T{{{min_a_count},}}', seq):
+            sites.append({"chrom": chrom, "start": m.start(), "stop": m.end(), "strand": "-"})
+
+    df = pd.DataFrame(sites)
+    print(f"  Found {len(df)} raw polyA sites (≥{min_a_count} A/T)")
+
+    # Exclude regions using bedtools if BEDs provided
+    if exclude_beds:
+        import tempfile, subprocess, os
+        tmp_in = tempfile.NamedTemporaryFile(mode="w", suffix=".bed", delete=False)
+        df[["chrom", "start", "stop", "strand"]].to_csv(tmp_in, sep="\t", header=False, index=False)
+        tmp_in.close()
+
+        current = tmp_in.name
+        for bed_path in exclude_beds:
+            tmp_out = tempfile.NamedTemporaryFile(mode="w", suffix=".bed", delete=False)
+            tmp_out.close()
+            subprocess.run(
+                ["bedtools", "intersect", "-v", "-a", current, "-b", bed_path],
+                stdout=open(tmp_out.name, "w"), check=True,
+            )
+            if current != tmp_in.name:
+                os.unlink(current)
+            current = tmp_out.name
+
+        df = pd.read_csv(current, sep="\t", header=None,
+                         names=["chrom", "start", "stop", "strand"])
+        os.unlink(current)
+        os.unlink(tmp_in.name)
+        print(f"  After exclusion: {len(df)} intergenic non-TE polyA sites")
+
+    # Subsample
+    if len(df) > max_sites:
+        df = df.sample(n=max_sites, random_state=seed).reset_index(drop=True)
+        print(f"  Subsampled to {max_sites} sites")
+
+    return df
+
+
+def extract_polyA_background(
+    bam_path: str,
+    ref_path: str,
+    min_a_count: int = 6,
+    upstream_bp: int = 800,
+    n_bins: int = 100,
+    max_sites: int = 5000,
+    exclude_beds: list[str] = None,
+    seed: int = 42,
+    chroms: list[str] = None,
+) -> dict:
+    """
+    Build a background coverage footprint upstream of genomic polyA sites.
+
+    For each polyA site, extracts coverage in a window [upstream_bp .. polyA .. downstream_bp]
+    oriented so the polyA is at the right (3') end, matching how a TE footprint
+    would look if the signal were purely polyA-priming artifact.
+
+    Returns dict with:
+        "sense_mean": (n_bins,) mean sense coverage
+        "antisense_mean": (n_bins,) mean antisense coverage
+        "sense_5p_mean": (n_bins,) mean sense 5' read ends
+        "antisense_5p_mean": (n_bins,) mean antisense 5' read ends
+        "bin_centers": (n_bins,) positions from -1.0 (far upstream) to 0.0 (polyA start)
+        "n_sites": int
+        "polyA_lengths": list of polyA tract lengths
+    """
+    import pysam
+
+    print(f"Scanning reference for polyA sites (≥{min_a_count} consecutive A/T)...")
+    sites_df = scan_polyA_sites(
+        ref_path, min_a_count=min_a_count,
+        exclude_beds=exclude_beds, max_sites=max_sites,
+        seed=seed, chroms=chroms,
+    )
+
+    if len(sites_df) == 0:
+        raise ValueError("No polyA sites found after filtering")
+
+    bam = pysam.AlignmentFile(bam_path, "rb")
+    bam_chroms = set(bam.references)
+    chrom_sizes = dict(zip(bam.references, bam.lengths))
+
+    # We want a window: [upstream_bp before polyA start] ... [polyA start]
+    # with a small downstream buffer (half of upstream) to show the drop-off
+    downstream_bp = upstream_bp // 4
+    total_window = upstream_bp + downstream_bp
+    bin_centers = np.linspace(-1.0, downstream_bp / upstream_bp, n_bins)
+
+    all_sense = []
+    all_antisense = []
+    all_sense_5p = []
+    all_antisense_5p = []
+    polyA_lengths = []
+
+    total = len(sites_df)
+    for i, (_, row) in enumerate(sites_df.iterrows()):
+        if (i + 1) % 1000 == 0:
+            print(f"  Processing polyA site {i+1}/{total}...")
+
+        chrom = row["chrom"]
+        bam_chrom = _resolve_chrom(chrom, bam_chroms)
+        if bam_chrom is None:
+            continue
+
+        chrom_len = chrom_sizes[bam_chrom]
+        pa_strand = row["strand"]
+        pa_start = row["start"]
+        pa_stop = row["stop"]
+        pa_len = pa_stop - pa_start
+
+        # Define extraction window oriented to polyA direction
+        if pa_strand == "+":
+            # polyA is A-run: reads come from upstream (left)
+            # window: [pa_start - upstream_bp, pa_start + downstream_bp]
+            ext_start = max(0, pa_start - upstream_bp)
+            ext_stop = min(chrom_len, pa_start + downstream_bp)
+        else:
+            # polyA is T-run on fwd strand = A-run on rev strand
+            # reads come from upstream on rev strand = right side genomically
+            ext_start = max(0, pa_stop - downstream_bp)
+            ext_stop = min(chrom_len, pa_stop + upstream_bp)
+
+        region_len = ext_stop - ext_start
+        if region_len <= 0 or region_len < n_bins:
+            continue
+
+        # Coverage
+        try:
+            fwd_counts = bam.count_coverage(
+                bam_chrom, ext_start, ext_stop,
+                quality_threshold=0,
+                read_callback=lambda r: (not r.is_reverse and not r.is_secondary
+                                         and not r.is_supplementary),
+            )
+            fwd_vals = np.array(fwd_counts).sum(axis=0).astype(np.float32)
+
+            rev_counts = bam.count_coverage(
+                bam_chrom, ext_start, ext_stop,
+                quality_threshold=0,
+                read_callback=lambda r: (r.is_reverse and not r.is_secondary
+                                         and not r.is_supplementary),
+            )
+            rev_vals = np.array(rev_counts).sum(axis=0).astype(np.float32)
+        except Exception:
+            continue
+
+        # 5' ends
+        fwd_5p = np.zeros(region_len, dtype=np.float32)
+        rev_5p = np.zeros(region_len, dtype=np.float32)
+        for read in bam.fetch(bam_chrom, ext_start, ext_stop):
+            if read.is_unmapped or read.is_secondary or read.is_supplementary:
+                continue
+            if read.is_reverse:
+                pos = read.reference_end
+                if pos is None:
+                    continue
+            else:
+                pos = read.reference_start
+            idx = pos - ext_start
+            if 0 <= idx < region_len:
+                if read.is_reverse:
+                    rev_5p[idx] += 1
+                else:
+                    fwd_5p[idx] += 1
+
+        # Orient: sense = same direction as polyA transcription
+        if pa_strand == "+":
+            sense_cov, antisense_cov = fwd_vals, rev_vals
+            sense_5p, antisense_5p = fwd_5p, rev_5p
+        else:
+            sense_cov = rev_vals[::-1]
+            antisense_cov = fwd_vals[::-1]
+            sense_5p = rev_5p[::-1]
+            antisense_5p = fwd_5p[::-1]
+
+        # Bin
+        all_sense.append(_resize_to_bins(sense_cov, n_bins))
+        all_antisense.append(_resize_to_bins(antisense_cov, n_bins))
+        all_sense_5p.append(_resize_to_bins(sense_5p, n_bins))
+        all_antisense_5p.append(_resize_to_bins(antisense_5p, n_bins))
+        polyA_lengths.append(pa_len)
+
+    bam.close()
+
+    if len(all_sense) == 0:
+        raise ValueError("No polyA sites had extractable coverage")
+
+    sense_mat = np.stack(all_sense)
+    antisense_mat = np.stack(all_antisense)
+
+    result = {
+        "sense_mean": np.nanmean(sense_mat, axis=0),
+        "sense_median": np.nanmedian(sense_mat, axis=0),
+        "antisense_mean": np.nanmean(antisense_mat, axis=0),
+        "antisense_median": np.nanmedian(antisense_mat, axis=0),
+        "sense_5p_mean": np.nanmean(np.stack(all_sense_5p), axis=0),
+        "antisense_5p_mean": np.nanmean(np.stack(all_antisense_5p), axis=0),
+        "bin_centers": bin_centers,
+        "n_sites": len(all_sense),
+        "polyA_lengths": polyA_lengths,
+    }
+
+    return result
+
+
+def plot_polyA_background(bg: dict, save_path: str = None):
+    """Plot the polyA background footprint."""
+    import matplotlib.pyplot as plt
+
+    bc = bg["bin_centers"]
+    fig, axes = plt.subplots(3, 1, figsize=(12, 12))
+
+    # Panel 1: Coverage
+    ax = axes[0]
+    ax.axvline(0, color="#333", linewidth=1.5, linestyle="--", label="polyA start")
+    ax.plot(bc, bg["sense_mean"], color="#2166ac", linewidth=1.5, label="Sense")
+    ax.fill_between(bc, bg["sense_mean"], alpha=0.3, color="#2166ac")
+    ax.plot(bc, bg["antisense_mean"], color="#b2182b", linewidth=1.5, label="Antisense")
+    ax.fill_between(bc, bg["antisense_mean"], alpha=0.3, color="#b2182b")
+    ax.set_ylabel("Mean coverage", fontsize=10)
+    ax.set_title(f"PolyA background footprint (n={bg['n_sites']} sites)", fontsize=12)
+    ax.legend(fontsize=9)
+
+    # Panel 2: 5' ends
+    ax = axes[1]
+    ax.axvline(0, color="#333", linewidth=1.5, linestyle="--")
+    ax.plot(bc, bg["sense_5p_mean"], color="#2166ac", linewidth=1.5, label="Sense 5' ends")
+    ax.fill_between(bc, bg["sense_5p_mean"], alpha=0.3, color="#2166ac")
+    ax.plot(bc, bg["antisense_5p_mean"], color="#b2182b", linewidth=1.5, label="Antisense 5' ends")
+    ax.fill_between(bc, bg["antisense_5p_mean"], alpha=0.3, color="#b2182b")
+    ax.set_ylabel("Mean 5' read ends", fontsize=10)
+    ax.set_title("Read 5' end density", fontsize=12)
+    ax.legend(fontsize=9)
+
+    # Panel 3: polyA length distribution
+    ax = axes[2]
+    ax.hist(bg["polyA_lengths"], bins=50, color="#7570b3", alpha=0.7, edgecolor="white")
+    ax.set_xlabel("PolyA tract length (bp)", fontsize=10)
+    ax.set_ylabel("Count", fontsize=10)
+    ax.set_title("Distribution of polyA tract lengths", fontsize=12)
+
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+        plt.close()
+        print(f"PolyA background plot saved to {save_path}")
+    else:
+        plt.show()
+        plt.close()
+
+
 def load_samples_file(path: str) -> dict[str, list[str]]:
     """
     Load samples TSV: bam_path<TAB>condition
